@@ -1,0 +1,39 @@
+{
+  "expo": {
+    "name": "OpenMuse",
+    "slug": "openmuse",
+    "scheme": "openmuse",
+    "version": "0.1.0",
+    "orientation": "default",
+    "icon": "./assets/capybara.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "description": "Chat with your agent, track tasks, mail, calendar, browser and files.",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "app.openmuse.mobile"
+    },
+    "android": {
+      "package": "app.openmuse.mobile"
+    },
+    "web": {
+      "bundler": "metro",
+      "name": "OpenMuse — a little room for everything",
+      "shortName": "OpenMuse",
+      "lang": "en",
+      "scope": "/",
+      "startUrl": "/",
+      "display": "standalone",
+      "orientation": "any",
+      "backgroundColor": "#FCFCFC",
+      "themeColor": "#11191C",
+      "description": "Chat with your agent, track tasks, mail, calendar, browser and files.",
+      "favicon": "./public/favicon.png"
+    },
+    "plugins": [
+      "expo-document-picker",
+      "@config-plugins/react-native-blob-util",
+      "@config-plugins/react-native-pdf"
+    ]
+  }
+}
