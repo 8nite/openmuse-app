@@ -24,7 +24,7 @@ export const ok = (stdout = ""): DockerResult => ({
   interrupted: false,
   truncated: false,
 });
-export function sandbox(running = true, owner = "owner") {
+export function sandbox(running = true, owner = "owner", network: "none" | "bridge" = "none") {
   const identity = computerIdentity(config, owner);
   return {
     Id: "container-id",
@@ -44,7 +44,7 @@ export function sandbox(running = true, owner = "owner") {
       CapDrop: ["ALL"],
       CapAdd: null,
       SecurityOpt: ["no-new-privileges"],
-      NetworkMode: "none",
+      NetworkMode: network,
       Memory: 536870912,
       MemorySwap: 536870912,
       PidsLimit: 128,
@@ -59,7 +59,7 @@ export function sandbox(running = true, owner = "owner") {
       RestartPolicy: { Name: "no" },
     },
     Mounts: [{ Type: "volume", Name: identity.volume, Destination: "/workspace", RW: true }],
-    NetworkSettings: { Networks: { none: {} } },
+    NetworkSettings: { Networks: { [network]: {} } },
     State: { Running: running },
   };
 }

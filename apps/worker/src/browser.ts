@@ -25,12 +25,98 @@ type Running = {
   pending: Set<Promise<void>>;
   downloadError?: boolean;
 };
+/** One live screencast per session, fanned out to every stream viewer. */
+type StreamHub = {
+  clients: Set<(frame: Buffer) => void>;
+  aborts: Set<() => void>;
+  cdp: ScreencastSession | null;
+  starting: Promise<void> | null;
+};
+/** Minimal CDP surface for screencasts (Playwright types no unlisted CDP events). */
+interface ScreencastSession {
+  on(event: "Page.screencastFrame", listener: (payload: { data: string; sessionId: string }) => void): unknown;
+  send(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  removeAllListeners(event?: string): unknown;
+  detach(): Promise<unknown>;
+}
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function validateSessionId(id: unknown): string {
   if (typeof id !== "string" || !SESSION_ID.test(id))
     throw new WorkerError("INVALID_SESSION", "A valid UUID session ID is required.");
   return id.toLowerCase();
+}
+
+/** Viewport coordinates shared by every pointer input (1280x800 session viewport). */
+function validPoint(input: Record<string, unknown>): { x: number; y: number } | null {
+  const { x, y } = input;
+  if (
+    typeof x !== "number" ||
+    typeof y !== "number" ||
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    x < 0 ||
+    y < 0 ||
+    x >= 1280 ||
+    y >= 800
+  )
+    return null;
+  return { x, y };
+}
+
+/** Reference IDs anti-bot vendors print on block pages (e.g. Imperva's Request ID). */
+const BLOCK_REF = /(?:request|incident|reference)\s*id\s*[:#]?\s*[\w-]{6,}/i;
+
+function blockVendor(title: string, text: string): string | null {
+  const haystack = `${title}\n${text}`;
+  if (/incapsula|imperva/i.test(haystack) && (BLOCK_REF.test(haystack) || /forbidden/i.test(title)))
+    return "Imperva";
+  if (
+    /cloudflare/i.test(haystack) &&
+    /attention required|verify you are human|just a moment/i.test(haystack)
+  )
+    return "Cloudflare";
+  if (/press\s*&\s*hold to confirm/i.test(haystack)) return "PerimeterX";
+  if (/datadome/i.test(haystack)) return "DataDome";
+  if (/pardon our interruption/i.test(haystack)) return "Akamai";
+  if (
+    /verify your identity/i.test(title) ||
+    (/robot or human/i.test(haystack) && /hold/i.test(haystack))
+  )
+    return "Akamai";
+  return null;
+}
+
+/**
+ * Anti-bot vendors answer with a block page instead of failing the load, so a
+ * refusal would otherwise surface as page content ("Forbidden 17925…").
+ * Detect those pages and fail with an actionable error instead. Pure and
+ * unit-tested; callers supply the main-document status when they have it.
+ */
+export function botBlockError(
+  host: string,
+  status: number | null,
+  title: string,
+  text: string,
+): WorkerError | null {
+  const vendor = blockVendor(title, text);
+  const denied = status === 403 || status === 429 || (status === 503 && vendor !== null);
+  // Bare vendor reference IDs with no label ("Forbidden\n1792600555-49182634-…").
+  const bareRef = text.match(/\b\d{7,}(?:-\d+){2,}\b/)?.[0];
+  const denialTitle = /forbidden|access denied|blocked/i.test(title);
+  const forbiddenBody = /forbidden/i.test(text) && bareRef !== undefined;
+  if (vendor === null && !(denied && denialTitle) && !forbiddenBody) return null;
+  const detail =
+    vendor === null
+      ? `anti-bot block (HTTP ${status ?? "unknown"})`
+      : `${vendor} anti-bot protection`;
+  const ref = (text.match(BLOCK_REF)?.[0] ?? bareRef)?.slice(0, 60);
+  return new WorkerError(
+    "BLOCKED_BY_SITE",
+    `${host} refused the cloud browser (${detail}${ref ? `, ${ref}` : ""}). ` +
+      "Take control and finish any human check yourself (press and hold its button), or open it in your own browser.",
+    502,
+  );
 }
 
 export async function createBrowserManager(
@@ -116,15 +202,48 @@ export async function createBrowserManager(
   async function navigate(id: string, url: string) {
     const target = await validatePublicUrl(url);
     const { page } = active(id);
+    async function probe() {
+      return page
+        .evaluate(() => ({
+          title: document.title.slice(0, 300),
+          text: (document.body?.innerText ?? "").slice(0, 4000),
+        }))
+        .catch(() => ({ title: "", text: "" }));
+    }
     try {
-      await page.goto(target.url.href, { waitUntil: "domcontentloaded", timeout: 20_000 });
+      // 45s (not 20s): domcontentloaded on a congested link can take >20s
+      // for heavy pages (measured 21.8s for github.com); the agent run that
+      // wraps this call has its own much larger budget.
+      const response = await page.goto(target.url.href, {
+        waitUntil: "domcontentloaded",
+        timeout: 45_000,
+      });
       // Chromium can follow redirects outside Playwright's initial route hook.
       // The proxy blocks those sockets, but its 403 is still an HTTP response:
       // validate the final location so the API does not report it as success.
       await validatePublicUrl(page.url());
+      // Anti-bot vendors answer with a block/challenge page instead of failing
+      // the load (often HTTP 200), so probe every navigation for refusal markers.
+      const seen = await probe();
+      const blocked = botBlockError(
+        target.url.host,
+        response?.status() ?? null,
+        seen.title,
+        seen.text,
+      );
+      if (blocked) throw blocked;
     } catch (error) {
+      if (error instanceof WorkerError && error.code === "BLOCKED_BY_SITE") throw error;
       if (error instanceof WorkerError && error.code === "BLOCKED_URL") {
         await page.goto("about:blank", { timeout: 5000 });
+      } else if (error instanceof Error && error.name === "TimeoutError") {
+        // Heavy pages can outlast domcontentloaded while fully usable
+        // (measured on a retail homepage). Continue when real content and no
+        // refusal markers are already there.
+        const slow = await probe();
+        const usable = slow.title.trim().length > 0 && slow.text.trim().length > 200;
+        if (usable && !botBlockError(target.url.host, null, slow.title, slow.text))
+          return refresh(id);
       }
       // A successful attachment intentionally aborts page navigation.
       if (!(error instanceof Error && /Download is starting/.test(error.message))) {
@@ -138,6 +257,7 @@ export async function createBrowserManager(
     return refresh(id);
   }
   async function closeSession(id: string) {
+    stopStream(id);
     const instance = running.get(id);
     const stored = sessions.get(id);
     if (!stored) throw new WorkerError("SESSION_NOT_FOUND", "Browser session not found.", 404);
@@ -180,17 +300,33 @@ export async function createBrowserManager(
     let context: BrowserContext;
     try {
       const { chromium } = await import("playwright");
-      context = await chromium.launchPersistentContext(profileDir, {
-        // Chromium does not need the worker API credential in its environment.
+      const common = {
+        // Chromium does not need the worker API credential in its environment,
+        // so only a minimal allowlist is passed through — plus the X display
+        // handles, without which a headed browser cannot reach Xvfb.
         env: {
           HOME: process.env.HOME ?? "/tmp",
           PATH: process.env.PATH ?? "/usr/bin:/bin",
           LANG: "C.UTF-8",
+          ...(process.env.DISPLAY ? { DISPLAY: process.env.DISPLAY } : {}),
+          ...(process.env.XAUTHORITY ? { XAUTHORITY: process.env.XAUTHORITY } : {}),
         },
-        headless: true,
+        // Headed under Xvfb (the Docker image runs via xvfb-run) so sites see
+        // a real desktop browser — compositor, media, timers — instead of
+        // headless shell. Without an X server (plain local dev) keep headless.
+        headless: !process.env.DISPLAY,
         viewport: { width: 1280, height: 800 },
+        // A normal Accept-Language instead of the container's bare locale.
+        locale: process.env.BROWSER_LOCALE ?? "en-US",
+        ...(process.env.BROWSER_TIMEZONE ? { timezoneId: process.env.BROWSER_TIMEZONE } : {}),
         proxy: { server: proxy.url, bypass: "<-loopback>" },
-        serviceWorkers: "block",
+        // Hosts that disable unprivileged user namespaces (Ubuntu 23.10+
+        // AppArmor default) cannot start Chromium's sandbox at all; without
+        // this every launch fails with "No usable sandbox". The worker keeps
+        // its other isolation (egress proxy, no credentials in env, download
+        // caps, read-only root + dropped caps in the container image).
+        chromiumSandbox: false,
+        serviceWorkers: "block" as const,
         acceptDownloads: true,
         downloadsPath: tempDirectory,
         timeout: 25_000,
@@ -200,7 +336,15 @@ export async function createBrowserManager(
           "--disable-extensions",
           "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
         ],
-      });
+      };
+
+      // Stock Chromium, headed under Xvfb in the Docker image. Branded
+      // Chrome was measured phoning home to Google on every launch
+      // (variations seed fetch), which conflicts with the worker's
+      // no-unexpected-egress posture, so it is deliberately not used; the
+      // headed stock build keeps the realism that matters (compositor,
+      // media, timers) without the telemetry.
+      context = await chromium.launchPersistentContext(profileDir, common);
     } catch {
       if (!previous) await rm(directory(id), { recursive: true, force: true });
       await rm(tempDirectory, { recursive: true, force: true });
@@ -229,8 +373,11 @@ export async function createBrowserManager(
         }
       });
       await context.routeWebSocket("**/*", (socket) => socket.close());
-      for (const old of context.pages()) await old.close();
-      const page = await context.newPage();
+      // Reuse the launch page: opening a new tab right after closing the
+      // only page fails unreliably, so keep the first and drop extras.
+      const existing = context.pages();
+      const page = existing[0] ?? (await context.newPage());
+      for (const old of existing.slice(1)) await old.close();
       page.setDefaultTimeout(10_000);
       const instance: Running = { context, page, touched: Date.now(), pending: new Set() };
       running.set(id, instance);
@@ -283,9 +430,10 @@ export async function createBrowserManager(
         await persist(failed);
       } else {
         sessions.delete(id);
-        await rm(directory(id), { recursive: true, force: true });
+        // Cleanup must never mask the original launch failure.
+        await rm(directory(id), { recursive: true, force: true }).catch(() => {});
       }
-      await rm(tempDirectory, { recursive: true, force: true });
+      await rm(tempDirectory, { recursive: true, force: true }).catch(() => {});
       throw error;
     }
   }
@@ -296,6 +444,110 @@ export async function createBrowserManager(
       }
   }, 60_000);
   sweeper.unref();
+  /** Live screencasts, one hub per session fanning out to every viewer. */
+  const streams = new Map<string, StreamHub>();
+  function stopStream(id: string) {
+    const hub = streams.get(id);
+    if (!hub) return;
+    streams.delete(id);
+    hub.clients.clear();
+    const cdp = hub.cdp;
+    hub.cdp = null;
+    if (cdp) {
+      cdp.removeAllListeners("Page.screencastFrame");
+      void cdp.send("Page.stopScreencast").catch(() => {});
+    }
+    // Viewers hanging on a dead screencast must reconnect, not freeze.
+    for (const abort of hub.aborts) {
+      try {
+        abort();
+      } catch {
+        /* Client already gone. */
+      }
+    }
+    hub.aborts.clear();
+  }
+  async function subscribe(
+    id: string,
+    onFrame: (frame: Buffer) => void,
+    onAbort: () => void = () => {},
+  ): Promise<() => void> {
+    const instance = active(id);
+    let hub = streams.get(id);
+    if (!hub) {
+      hub = { clients: new Set(), aborts: new Set(), cdp: null, starting: null };
+      streams.set(id, hub);
+    }
+    hub.clients.add(onFrame);
+    hub.aborts.add(onAbort);
+    if (!hub.cdp && !hub.starting) {
+      const current = hub;
+      current.starting = (async () => {
+        const cdp = (await instance.page
+          .context()
+          .newCDPSession(instance.page)) as unknown as ScreencastSession;
+        cdp.on("Page.screencastFrame", ({ data, sessionId }) => {
+          void cdp.send("Page.screencastFrameAck", { sessionId }).catch(() => {});
+          const frame = Buffer.from(data, "base64");
+          instance.touched = Date.now();
+          for (const send of current.clients) {
+            try {
+              send(frame);
+            } catch {
+              /* A slow viewer must not break the stream for the rest. */
+            }
+          }
+        });
+        await cdp.send("Page.startScreencast", {
+          format: "jpeg",
+          quality: 65,
+          maxWidth: 1280,
+          maxHeight: 800,
+          everyNthFrame: 1,
+        });
+        // The session may have closed while the screencast was starting.
+        if (!streams.get(id) || !current.clients.size) {
+          cdp.removeAllListeners("Page.screencastFrame");
+          await cdp.send("Page.stopScreencast").catch(() => {});
+          await cdp.detach().catch(() => {});
+          throw new WorkerError("SESSION_CLOSED", "Browser session closed.", 409);
+        }
+        current.cdp = cdp;
+      })();
+      try {
+        await current.starting;
+      } catch (error) {
+        if (streams.get(id) === current && !current.cdp) streams.delete(id);
+        current.clients.delete(onFrame);
+        current.aborts.delete(onAbort);
+        throw error;
+      } finally {
+        current.starting = null;
+      }
+    } else if (hub.starting) {
+      try {
+        await hub.starting;
+      } catch (error) {
+        hub.clients.delete(onFrame);
+        hub.aborts.delete(onAbort);
+        throw error;
+      }
+      if (!hub.cdp) {
+        hub.clients.delete(onFrame);
+        hub.aborts.delete(onAbort);
+        throw new WorkerError("SESSION_CLOSED", "Browser session closed.", 409);
+      }
+    }
+    instance.touched = Date.now();
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      hub?.clients.delete(onFrame);
+      hub?.aborts.delete(onAbort);
+      if (hub && hub.clients.size === 0 && !hub.starting) stopStream(id);
+    };
+  }
   return {
     list: () => [...sessions.values()],
     create: (id: string, url: string) =>
@@ -304,6 +556,18 @@ export async function createBrowserManager(
     closeSession: (id: string) => serial(id, () => closeSession(id)),
     screenshot: (id: string) =>
       serial(id, () => active(id).page.screenshot({ type: "png", timeout: 10_000 })),
+    subscribe,
+    /**
+     * Hover pointer fast path: outside the serial queue so cursor moves stay
+     * live instead of lining up behind clicks and scrolls. Held-drag moves
+     * keep using input() so down/move/up stay ordered.
+     */
+    move: (id: string, input: Record<string, unknown>) => {
+      const point = validPoint(input);
+      if (!point) throw new WorkerError("INVALID_INPUT", "Unsupported browser input or coordinates.");
+      const { page } = active(id);
+      return page.mouse.move(point.x, point.y);
+    },
     read: (id: string) =>
       serial(id, async () => {
         const { page } = active(id);
@@ -319,6 +583,15 @@ export async function createBrowserManager(
           };
         });
         await validatePublicUrl(result.url);
+        // A block page reads as ordinary text; refuse it instead of reporting
+        // vendor boilerplate ("Forbidden …") as page content.
+        const refused = botBlockError(
+          new URL(result.url).hostname,
+          null,
+          result.title,
+          result.text.slice(0, 4000),
+        );
+        if (refused) throw refused;
         const session: Session = {
           id,
           url: result.url,
@@ -333,19 +606,20 @@ export async function createBrowserManager(
     input: (id: string, input: Record<string, unknown>) =>
       serial(id, async () => {
         const { page } = active(id);
-        const { type, x, y, key, text, deltaY } = input;
-        if (
-          type === "click" &&
-          typeof x === "number" &&
-          typeof y === "number" &&
-          Number.isFinite(x) &&
-          Number.isFinite(y) &&
-          x >= 0 &&
-          x < 1280 &&
-          y >= 0 &&
-          y < 800
-        )
-          await page.mouse.click(x, y);
+        const { type, key, text, deltaY } = input;
+        const point = validPoint(input);
+        if (type === "click" && point) await page.mouse.click(point.x, point.y);
+        // Press-and-hold primitives for human checks ("Robot or human?" hold
+        // buttons). Only the takeover console sends these, with the user's
+        // own timing between down and up — the agent never auto-holds.
+        else if (type === "down" && point) {
+          await page.mouse.move(point.x, point.y, { steps: 5 });
+          await page.mouse.down();
+        } else if (type === "move" && point) {
+          // Drag repositioning while held, or hover positioning. Throttled
+          // client-side; each step is a genuine user pointer event.
+          await page.mouse.move(point.x, point.y, { steps: 3 });
+        } else if (type === "up") await page.mouse.up();
         else if (type === "text" && typeof text === "string" && text.length <= 10_000)
           await page.keyboard.insertText(text);
         else if (

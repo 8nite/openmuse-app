@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
-import { request } from "node:http";
+import { createServer, request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -10,6 +10,7 @@ import { createApp } from "../apps/server/src/app.ts";
 import { Auth } from "../apps/server/src/auth.ts";
 import { BrowserService } from "../apps/server/src/browser.ts";
 import { Files } from "../apps/server/src/files.ts";
+import { botBlockError } from "../apps/worker/src/browser.ts";
 import { capturePdfDownload, readDownloadFailures } from "../apps/worker/src/downloads.ts";
 import { isPublicIp, validatePublicUrl } from "../apps/worker/src/network.ts";
 import { startEgressProxy } from "../apps/worker/src/proxy.ts";
@@ -67,7 +68,7 @@ test("browser API reopens an owned profile at the edited address and renews cons
   assert.notEqual(renewed.consoleUrl, previous.consoleUrl);
   const console = await app.request(renewed.consoleUrl);
   assert.equal(console.status, 200);
-  assert.match(await console.text(), /Text to type in browser/);
+  assert.match(await console.text(), /Browser keyboard/);
   assert.equal((await app.request(path)).status, 401);
   const hiddenId = "00000000-0000-4000-8000-000000000099";
   await db.put("someone-else", "browsers", { ...savedSession, id: hiddenId });
@@ -111,6 +112,80 @@ test("console input persists the worker's current page title and URL", async (t)
   assert.deepEqual(await service.get("owner", sessionId), updated);
 });
 
+test("takeover console streams live frames and routes hover moves off the serial queue", async (t) => {
+  const calls: string[] = [];
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  const worker = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      calls.push(`${req.method} ${req.url}`);
+      if (req.url?.endsWith("/stream")) {
+        res.writeHead(200, {
+          "content-type": "multipart/x-mixed-replace; boundary=openmuse-frame",
+        });
+        res.end(
+          Buffer.concat([
+            Buffer.from(
+              `--openmuse-frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.length}\r\n\r\n`,
+            ),
+            jpeg,
+            Buffer.from("\r\n"),
+          ]),
+        );
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(req.url?.endsWith("/move") ? { ok: true } : { ...savedSession }));
+    });
+  });
+  worker.listen(0, "127.0.0.1");
+  await once(worker, "listening");
+  t.after(async () => {
+    worker.closeAllConnections();
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+  });
+  const address = worker.address();
+  assert(address && typeof address !== "string");
+  const { db, config } = await browserFixture(t, () => ({ data: { ...savedSession } }));
+  const { app, auth, agent } = await createApp(db, {
+    ...config,
+    workerUrl: `http://127.0.0.1:${address.port}`,
+  });
+  t.after(() => agent.stop());
+  const { token } = await auth.session();
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  await db.put("local-user", "browsers", savedSession);
+
+  const stream = await app.request(`/api/browsers/${sessionId}/stream`, { headers });
+  assert.equal(stream.status, 200);
+  assert.match(stream.headers.get("content-type") ?? "", /multipart\/x-mixed-replace/);
+  const payload = Buffer.from(await stream.arrayBuffer());
+  assert.ok(payload.includes("openmuse-frame"), "stream sends multipart frames");
+  assert.ok(payload.includes(jpeg), "stream sends JPEG frames");
+
+  const hover = await app.request(`/api/browsers/${sessionId}/console`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ type: "move", x: 100, y: 100 }),
+  });
+  assert.deepEqual(await hover.json(), { ok: true });
+  const held = await app.request(`/api/browsers/${sessionId}/console`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ type: "move", held: true, x: 100, y: 100 }),
+  });
+  assert.deepEqual(await held.json(), { ok: true });
+  assert.ok(
+    calls.some((call) => call.includes(`/sessions/${sessionId}/move`)),
+    "hover uses the fast path",
+  );
+  assert.ok(
+    calls.some((call) => call.includes(`/sessions/${sessionId}/input`)),
+    "held drag stays ordered",
+  );
+});
+
 test("failed creation remains app-visible and can be retried with its original UUID", async (t) => {
   let failing = true;
   let requestedId: unknown;
@@ -130,6 +205,82 @@ test("failed creation remains app-visible and can be retried with its original U
   const result = await service.reopen("owner", sessions[0].id);
   assert.equal(result.id, sessions[0]?.id);
   assert.equal(result.status, "active");
+});
+
+test("standby sessions are handed out on create and refilled", async (t) => {
+  const launched: unknown[] = [];
+  const { config, service } = await browserFixture(t, (path, body) => {
+    if (path === "/sessions") launched.push(body.id);
+    return {
+      data: {
+        id: body.id,
+        url: body.url,
+        title: "New session",
+        status: "active",
+        updatedAt: new Date().toISOString(),
+      },
+    };
+  });
+  async function waitForLaunches(count: number) {
+    const start = Date.now();
+    while (launched.length < count) {
+      if (Date.now() - start > 10_000) throw new Error("standby refill timed out");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  // The fixture disables the pool for deterministic call sequences; opt in here.
+  config.standbySessions = 1;
+  await service.warmStandby();
+  assert.equal(launched.length, 1);
+  const first = await service.create("owner", "https://example.org/one");
+  assert.equal(first.id, launched[0], "first create hands out the pooled session");
+  // The handoff refills the pool in the background before the next create.
+  await waitForLaunches(3);
+  const refilled = launched.find((id) => id !== first.id);
+  assert.ok(refilled);
+  const second = await service.create("owner", "https://example.org/two");
+  assert.equal(second.id, refilled, "second create reuses the refilled standby");
+  assert.notEqual(second.id, first.id);
+});
+
+test("chat browser first read reuses the standby pool instead of cold-launching", async (t) => {
+  const launched: unknown[] = [];
+  let currentUrl = "https://example.org/standby";
+  const { config, service } = await browserFixture(t, (path, body) => {
+    if (path === "/sessions") {
+      launched.push(body.id);
+      currentUrl = String(body.url);
+      return {
+        data: {
+          id: body.id,
+          url: body.url,
+          title: "New session",
+          status: "active",
+          updatedAt: new Date().toISOString(),
+        },
+      };
+    }
+    return { data: { url: currentUrl, title: "Read", text: "chat page", truncated: false } };
+  });
+  config.standbySessions = 1;
+  await service.warmStandby();
+  assert.equal(launched.length, 1);
+  const first = await service.observeForThread("owner", "chat-thread", "https://example.org/chat");
+  assert.equal(first.sessionId, launched[0], "first chat browse hands out the pooled session");
+  // Same thread reuses its pinned profile.
+  const repeat = await service.observeForThread("owner", "chat-thread", "https://example.org/chat2");
+  assert.equal(repeat.sessionId, first.sessionId);
+  // The handoff refills the pool in the background for the next thread.
+  const start = Date.now();
+  let refilled: unknown;
+  while (Date.now() - start < 10_000) {
+    refilled = launched.find((id) => id !== first.sessionId);
+    if (refilled) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(refilled, "standby pool refills after the chat handoff");
+  const other = await service.observeForThread("owner", "other-thread", "https://example.org/other");
+  assert.equal(other.sessionId, refilled, "next chat thread reuses the refilled standby");
 });
 
 test("browser observations reuse an owned profile and reject unowned reads", async (t) => {
@@ -236,6 +387,24 @@ test("chat browser retries failed navigation using the reserved profile", async 
   assert.deepEqual(ids, [result.sessionId, result.sessionId]);
   assert.equal(result.text, "Actual contents");
   assert.equal(result.truncated, true);
+});
+
+test("a blocked read still surfaces its live session id for Take control", async (t) => {
+  const { db, service } = await browserFixture(t, (path, body) => {
+    if (path.endsWith("/read"))
+      return { status: 502, data: { error: { message: "Refused by example.org" } } };
+    return { data: { ...savedSession, id: body.id, url: body.url } };
+  });
+  const failure = await service.observeForThread("owner", "chat-thread", savedSession.url).then(
+    () => assert.fail("blocked read must reject"),
+    (error: unknown) => error,
+  );
+  assert.match(String((failure as Error).message), /Refused by example\.org/);
+  const sessionId = (failure as { browserSessionId?: unknown }).browserSessionId;
+  assert.equal(typeof sessionId, "string");
+  const [saved] = await db.list<BrowserSession>("owner", "browsers");
+  assert.equal(saved?.id, sessionId, "the challenge page session must persist");
+  assert.equal(saved?.status, "active", "worker open succeeded; only the read was refused");
 });
 
 test("concurrent chat reads keep each navigation paired with its page read", async (t) => {
@@ -483,6 +652,94 @@ test("worker recovery reconciles published downloads and transfers without files
       },
     );
   }
+});
+
+test("bot block pages are refused with an actionable error, not page text", async () => {
+  const imperva = botBlockError(
+    "www.walmart.ca",
+    403,
+    "Forbidden",
+    "Forbidden\nRequest ID: 1792596004-027221726-30430400238-972211726\nIncapsula",
+  );
+  assert.ok(imperva);
+  assert.equal(imperva.code, "BLOCKED_BY_SITE");
+  assert.match(imperva.message, /www\.walmart\.ca refused the cloud browser/);
+  assert.match(imperva.message, /Imperva/);
+  assert.match(imperva.message, /own browser/);
+
+  const cloudflare = botBlockError(
+    "example.com",
+    503,
+    "Attention Required! | Cloudflare",
+    "Verify you are human by completing the action below.\nCloudflare",
+  );
+  assert.ok(cloudflare);
+  assert.equal(cloudflare.code, "BLOCKED_BY_SITE");
+
+  // Akamai answers HTTP 200 with a challenge page, so markers must match
+  // without an error status. Both the dead-end and the hold-modal variants.
+  const akamaiDeadEnd = botBlockError(
+    "www.walmart.ca",
+    200,
+    "Verify Your Identity",
+    "We like real shoppers, not robots!\nPlease press and hold the button below to verify yourself",
+  );
+  assert.ok(akamaiDeadEnd);
+  assert.equal(akamaiDeadEnd.code, "BLOCKED_BY_SITE");
+  assert.match(akamaiDeadEnd.message, /Akamai/);
+  assert.match(akamaiDeadEnd.message, /Take control/);
+
+  const akamaiModal = botBlockError(
+    "www.walmart.ca",
+    200,
+    "Online Shopping Canada: Everyday Low Prices at Walmart.ca!",
+    "Robot or human?\nActivate and hold the button to confirm that you're human. Thank You!",
+  );
+  assert.ok(akamaiModal);
+  assert.equal(akamaiModal.code, "BLOCKED_BY_SITE");
+
+  // Bare "Forbidden <ref>" block page with an empty title, as served for
+  // walmart.ca over HTTP 200 with no vendor wording on the page.
+  const bare = botBlockError(
+    "www.walmart.ca",
+    200,
+    "",
+    "Forbidden\n1792600555-49182634-15394164442-49182634",
+  );
+  assert.ok(bare);
+  assert.equal(bare.code, "BLOCKED_BY_SITE");
+  assert.match(bare.message, /Take control/);
+
+  // Same shape but denied with a non-standard status (observed HTTP 456):
+  // the reference ID alone plus "Forbidden" is enough to refuse cleanly.
+  const oddStatus = botBlockError(
+    "www.walmart.ca",
+    456,
+    "",
+    "Forbidden\n1792615509-90052962-28186577106-90052962",
+  );
+  assert.ok(oddStatus);
+  assert.equal(oddStatus.code, "BLOCKED_BY_SITE");
+  assert.match(oddStatus.message, /HTTP 456/);
+  assert.match(oddStatus.message, /1792615509-90052962/);
+  assert.match(oddStatus.message, /Take control/);
+
+  // Ordinary pages never match, even on error statuses without denial markers.
+  assert.equal(botBlockError("example.com", 200, "Example Domain", "Example text"), null);
+  assert.equal(
+    botBlockError("example.com", 403, "Example Domain", "Example text without markers"),
+    null,
+  );
+  assert.equal(botBlockError("example.com", null, "Example Domain", "Example text"), null);
+  assert.equal(
+    botBlockError(
+      "example.com",
+      200,
+      "Order confirmation",
+      "Order 1792600555-49182634-1539 shipped",
+    ),
+    null,
+  );
 });
 
 test("browser rejects private, special-use and encoded IP addresses", async () => {

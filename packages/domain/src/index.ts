@@ -67,6 +67,16 @@ export interface BrowserSession {
   updatedAt: string;
   previewUrl?: string;
   consoleUrl?: string;
+  streamUrl?: string;
+}
+export interface DeviceSession {
+  id: string;
+  title: string;
+  packageOrUrl: string;
+  status: "idle" | "active" | "closed" | "error";
+  updatedAt: string;
+  previewUrl?: string;
+  consoleUrl?: string;
 }
 export const emailDraftSchema = z.object({
   to: z.array(z.email()).min(1).max(50),
@@ -125,6 +135,68 @@ export const eventDraftSchema = z
       ctx.addIssue({ code: "custom", message: "Invalid time zone", path: ["timeZone"] });
     }
   });
+export const deviceTapSchema = z.object({
+  type: z.literal("tap"),
+  x: z.number().int().min(0).max(4000),
+  y: z.number().int().min(0).max(4000),
+});
+export const deviceSwipeSchema = z.object({
+  type: z.literal("swipe"),
+  x1: z.number().int().min(0).max(4000),
+  y1: z.number().int().min(0).max(4000),
+  x2: z.number().int().min(0).max(4000),
+  y2: z.number().int().min(0).max(4000),
+  durationMs: z.number().int().min(50).max(5000).default(250),
+});
+export const deviceTextSchema = z.object({
+  type: z.literal("text"),
+  text: z.string().min(1).max(10000),
+});
+export const deviceKeySchema = z.object({
+  type: z.literal("key"),
+  key: z.enum(["back", "home", "recents", "play_pause", "Enter", "Tab", "Backspace"]),
+});
+/** Phone input shapes shared by the worker API, the PWA console and agent proposals. */
+export const deviceInputSchema = z.discriminatedUnion("type", [
+  deviceTapSchema,
+  deviceSwipeSchema,
+  deviceTextSchema,
+  deviceKeySchema,
+]);
+export type DeviceInput = z.infer<typeof deviceInputSchema>;
+/** Read-only phone observation requested by the agent or chat. */
+export const deviceObserveSchema = z.object({
+  sessionId: z.string().min(1).max(200).optional(),
+  intentUri: z.string().min(1).max(4096).optional(),
+});
+export type DeviceObserve = z.infer<typeof deviceObserveSchema>;
+/** Approval-gated phone control. The session is resolved from sessionId,
+ * the task's phone, or a fresh launch of intentUri. */
+export const deviceActionSchema = z
+  .object({
+    sessionId: z.string().min(1).max(200).optional(),
+    intentUri: z.string().min(1).max(4096).optional(),
+    action: z.discriminatedUnion("type", [
+      z.object({
+        type: z.literal("launch"),
+        intentUri: z.string().min(1).max(4096).optional(),
+      }),
+      deviceTapSchema,
+      deviceSwipeSchema,
+      deviceTextSchema,
+      deviceKeySchema,
+    ]),
+  })
+  .superRefine((value, ctx) => {
+    if (!value.sessionId && !value.intentUri && value.action.type !== "launch")
+      ctx.addIssue({
+        code: "custom",
+        message: "Open the phone on a link or app first, or pass its sessionId",
+      });
+    if (value.action.type === "launch" && !value.action.intentUri && !value.intentUri)
+      ctx.addIssue({ code: "custom", message: "A launch needs the link or app address to open" });
+  });
+export type DeviceAction = z.infer<typeof deviceActionSchema>;
 export const proposalSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("email.send"), data: emailDraftSchema }),
   z.object({ kind: z.literal("calendar.create"), data: eventDraftSchema }),
@@ -136,6 +208,7 @@ export const proposalSchema = z.discriminatedUnion("kind", [
     kind: z.literal("calendar.delete"),
     data: z.object({ calendarId: z.string(), eventId: z.string().min(1), title: z.string() }),
   }),
+  z.object({ kind: z.literal("device.action"), data: deviceActionSchema }),
 ]);
 export type EmailDraft = z.infer<typeof emailDraftSchema>;
 export type EventDraft = z.infer<typeof eventDraftSchema>;
@@ -187,6 +260,7 @@ export interface Workspace {
   events: CalendarEvent[];
   files: Artifact[];
   browsers: BrowserSession[];
+  devices: DeviceSession[];
   actions: ActionProposal[];
   activity: ActivityEntry[];
   connections: Connection[];

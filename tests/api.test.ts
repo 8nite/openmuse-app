@@ -338,3 +338,29 @@ test("guided document delegation streams a rich tool result bound to its saved t
   assert.equal(task?.kind, "document");
   assert.equal(task?.input.messageId, "mail-fieldtrip");
 });
+
+test("signing out revokes the session and is idempotent", async () => {
+  const created = await app.request("/api/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(created.status, 200);
+  const fresh = (await created.json()).token;
+  const auth = () => ({
+    Authorization: `Bearer ${fresh}`,
+    "Content-Type": "application/json",
+  });
+  assert.equal((await app.request("/api/workspace", { headers: auth() })).status, 200);
+  assert.deepEqual(
+    await (await app.request("/api/session/revoke", { method: "POST", headers: auth() })).json(),
+    { ok: true },
+  );
+  assert.equal((await app.request("/api/workspace", { headers: auth() })).status, 401);
+  // Idempotent: revoking again, or with no token at all, still succeeds.
+  assert.equal(
+    (await app.request("/api/session/revoke", { method: "POST", headers: auth() })).status,
+    200,
+  );
+  assert.equal((await app.request("/api/session/revoke", { method: "POST" })).status, 200);
+});

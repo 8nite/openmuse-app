@@ -448,6 +448,21 @@ export function timeLabel(value: string, timeZone?: string) {
 }
 export { relativeDate } from "./relative-date";
 
+export function describeFile(file: { mimeType: string; pageCount: number }): string {
+  if (file.mimeType === "application/pdf")
+    return `${file.pageCount} ${file.pageCount === 1 ? "page" : "pages"} · PDF`;
+  if (file.mimeType.startsWith("image/")) return "Image";
+  if (file.mimeType.startsWith("text/")) return "Text";
+  return "File";
+}
+
+export function fileKindLabel(mimeType: string): string {
+  if (mimeType === "application/pdf") return "PDF";
+  if (mimeType.startsWith("image/")) return "Image";
+  if (mimeType.startsWith("text/")) return "Text";
+  return "File";
+}
+
 export function resultSummary(value: string) {
   return /^Saved to (?:sample|local) sent mail(?: · .+)?$/.test(value)
     ? "Reply saved in your local Sent mail."

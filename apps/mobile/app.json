@@ -11,10 +11,14 @@
     "description": "Chat with your agent, track tasks, mail, calendar, browser and files.",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "app.openmuse.mobile"
+      "bundleIdentifier": "app.openmuse.mobile",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "OpenMuse records voice messages so they can be transcribed and answered in chat."
+      }
     },
     "android": {
-      "package": "app.openmuse.mobile"
+      "package": "app.openmuse.mobile",
+      "permissions": ["RECORD_AUDIO"]
     },
     "web": {
       "bundler": "metro",
@@ -32,6 +36,12 @@
     },
     "plugins": [
       "expo-document-picker",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow OpenMuse to record voice messages for transcription."
+        }
+      ],
       "@config-plugins/react-native-blob-util",
       "@config-plugins/react-native-pdf"
     ]

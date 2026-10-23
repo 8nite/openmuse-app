@@ -12,7 +12,7 @@ export class Auth {
     private readonly config: Config,
     private readonly signingKey: string,
   ) {}
-  async session(accessKey?: string) {
+  async session(accessKey?: string, owner = "local-user") {
     if (
       this.config.mode === "live" &&
       (!accessKey ||
@@ -23,10 +23,16 @@ export class Auth {
     const token = randomBytes(32).toString("base64url");
     await this.db.put("system", "sessions", {
       id: digest(token).toString("hex"),
-      owner: "local-user",
+      owner,
       expiresAt: Date.now() + 24 * 60 * 60 * 1000,
     });
     return { token, mode: this.config.mode };
+  }
+  async revoke(authorization?: string): Promise<void> {
+    // Idempotent: signing out of an expired or unknown session still succeeds,
+    // so the client can always clear its local state.
+    if (!authorization?.startsWith("Bearer ")) return;
+    await this.db.take("system", "sessions", digest(authorization.slice(7)).toString("hex"));
   }
   async owner(authorization?: string) {
     if (!authorization?.startsWith("Bearer ")) throw new AppError("Sign in to OpenMuse", 401);

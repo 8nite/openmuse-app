@@ -42,6 +42,12 @@ services:
         generateValue: true
       - key: TOKEN_ENCRYPTION_KEY
         generateValue: true
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_CONTACT
+        sync: false
       - key: OPENAI_API_KEY
         sync: false
       - key: CPK_INTELLIGENCE_API_KEY

@@ -37,9 +37,12 @@ import { ChatScreen, WorkspaceTools } from "./src/chat";
 import { ComputerEntry } from "./src/computer";
 import { ComputerDraftProvider } from "./src/computer-drafts";
 import { Details } from "./src/details";
+import { PwaInstallBanner } from "./src/notification-settings";
+import { ensurePwa } from "./src/pwa";
 import { BrowserScreen, CalendarScreen, FilesScreen, MailScreen } from "./src/screens";
 import { ThreadsProvider, ThreadsSheet, useMuseThread } from "./src/threads";
 import { Button, Card, colors, ErrorNotice, Field, IconButton, Mascot, s } from "./src/ui";
+import { useAgentNotifications } from "./src/use-web-notifications";
 import { type Detail, useWorkspace, WorkspaceContext } from "./src/workspace";
 
 const nav: { id: Section; label: string; icon: LucideIcon }[] = [
@@ -86,6 +89,9 @@ export default function App() {
   useEffect(() => {
     void connect();
   }, [connect]);
+  useEffect(() => {
+    ensurePwa();
+  }, []);
   return (
     <SafeAreaProvider>
       <StatusBar style="dark" />
@@ -94,7 +100,7 @@ export default function App() {
           runtimeUrl={`${API_URL}/api/copilotkit`}
           headers={{ Authorization: `Bearer ${token}` }}
         >
-          <WorkspaceApp token={token} />
+          <WorkspaceApp token={token} onLogout={() => setToken("")} />
         </CopilotKitProvider>
       ) : (
         <SafeAreaView
@@ -141,7 +147,7 @@ export default function App() {
     </SafeAreaProvider>
   );
 }
-function WorkspaceApp({ token }: { token: string }) {
+function WorkspaceApp({ token, onLogout }: { token: string; onLogout: () => void }) {
   const api = useMemo(() => new MuseApi(token), [token]);
   const [workspace, setWorkspace] = useState<Workspace>();
   const [section, setSection] = useState<Section>("chat");
@@ -175,6 +181,11 @@ function WorkspaceApp({ token }: { token: string }) {
   );
   const open = useCallback((next: Detail) => setDetail(next), []);
   const close = useCallback(() => setDetail(undefined), []);
+  const logout = useCallback(() => {
+    // Best-effort server revoke; the workspace closes locally regardless.
+    void api.request("/api/session/revoke", {}).catch(() => {});
+    onLogout();
+  }, [api, onLogout]);
   const ask = useCallback((text: string) => {
     setPrompt({ id: Date.now(), text });
     setSection("chat");
@@ -209,7 +220,18 @@ function WorkspaceApp({ token }: { token: string }) {
     );
   return (
     <WorkspaceContext.Provider
-      value={{ workspace, api, section, navigate, refresh, open, close, notify: setToast, ask }}
+      value={{
+        workspace,
+        api,
+        section,
+        navigate,
+        refresh,
+        open,
+        close,
+        logout,
+        notify: setToast,
+        ask,
+      }}
     >
       <AgentWorkspaceProvider>
         <ComputerDraftProvider key={token}>
@@ -242,6 +264,7 @@ function WorkspaceShell({
 }) {
   const { workspace, section, navigate, open } = useWorkspace();
   const { data } = useAgentWorkspace();
+  useAgentNotifications(data?.notifications, data?.tasks);
   const {
     selection,
     visited,
@@ -390,6 +413,7 @@ function WorkspaceShell({
                 paddingHorizontal: desktop ? 42 : 17,
               }}
             >
+              <PwaInstallBanner />
               <AgentStatus />
               {richThreads ? (
                 <>

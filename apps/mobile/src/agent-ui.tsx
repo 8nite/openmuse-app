@@ -9,11 +9,13 @@ import {
   Heart,
   Lightbulb,
   ListChecks,
+  LogOut,
   Mail,
   Pause,
   Play,
   Plus,
   RefreshCw,
+  Smartphone,
   Square,
   Target,
   Users,
@@ -22,7 +24,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Image, Linking, Pressable, Text, View } from "react-native";
 import Svg, { Defs, LinearGradient, Rect, Stop } from "react-native-svg";
-import type { Artifact, BrowserSession } from "../../../packages/domain/src";
+import type { Artifact, BrowserSession, DeviceSession } from "../../../packages/domain/src";
 import type {
   AgentArtifact,
   AgentMemory,
@@ -34,6 +36,7 @@ import type {
   RunEvent,
 } from "../../../packages/domain/src/agent";
 import { useAgentWorkspace } from "./agent-workspace";
+import { WebNotificationSettings } from "./notification-settings";
 import { ActivityScreen, ConnectionsScreen } from "./screens";
 import {
   Button,
@@ -41,6 +44,7 @@ import {
   CheckRow,
   Chip,
   colors,
+  describeFile,
   Empty,
   ErrorNotice,
   Field,
@@ -274,6 +278,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
     artifacts: AgentArtifact[];
     files: Artifact[];
     browsers: BrowserSession[];
+    devices?: DeviceSession[];
   }>();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -294,6 +299,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
         artifacts: AgentArtifact[];
         files: Artifact[];
         browsers: BrowserSession[];
+        devices?: DeviceSession[];
       }>(`/api/agent/tasks/${taskId}`)
       .then((result) => {
         if (active) {
@@ -576,11 +582,54 @@ export function TaskDetail({ taskId }: { taskId: string }) {
               </Button>
             </Card>
           ))}
+          {detail?.devices?.map((device) => (
+            <Card key={device.id} style={{ gap: 10 }}>
+              <View style={[s.row, { gap: 10 }]}>
+                <Smartphone size={18} color={colors.blueDark} />
+                <Text style={s.heading}>{device.title || "Agent phone"}</Text>
+              </View>
+              <Text style={s.small}>{device.packageOrUrl}</Text>
+              {device.status === "active" && device.previewUrl && (
+                <Image
+                  accessibilityLabel="Agent phone preview"
+                  source={{ uri: api.url(device.previewUrl) }}
+                  style={{
+                    width: "100%",
+                    aspectRatio: 9 / 16,
+                    maxHeight: 320,
+                    borderRadius: 12,
+                  }}
+                />
+              )}
+              <Button
+                small
+                busy={busy}
+                onPress={() => {
+                  setBusy(true);
+                  void (async () => {
+                    try {
+                      if (["running", "scheduled", "queued"].includes(task.status))
+                        await mutate(`/tasks/${taskId}/control`, { action: "pause" });
+                      open({ type: "device", device });
+                    } catch (error) {
+                      setError(errorText(error));
+                    } finally {
+                      setBusy(false);
+                    }
+                  })();
+                }}
+              >
+                {["running", "scheduled", "queued"].includes(task.status)
+                  ? "Pause and open phone"
+                  : "Open phone"}
+              </Button>
+            </Card>
+          ))}
           {detail?.files?.map((file) => (
             <LinkRow
               key={file.id}
               title={file.name}
-              detail={`${file.pageCount} pages · PDF`}
+              detail={describeFile(file)}
               icon={FileText}
               onPress={() => open({ type: "file", file })}
             />
@@ -1689,6 +1738,7 @@ export function NotificationsSheet() {
       subtitle="Results and decisions that need your attention."
       onClose={close}
     >
+      <WebNotificationSettings />
       <View style={{ gap: 14 }}>
         <ErrorNotice error={error} />
         {data?.notifications.map((item) => (
@@ -1719,7 +1769,7 @@ export function NotificationsSheet() {
   );
 }
 export function AppsScreen() {
-  const { navigate, open } = useWorkspace();
+  const { navigate, open, logout, workspace } = useWorkspace();
   const { data, mutate } = useAgentWorkspace();
   const [query, setQuery] = useState("");
   const [settings, setSettings] = useState(false);
@@ -1886,6 +1936,19 @@ export function AppsScreen() {
         </>
       )}
       <ErrorNotice error={error} />
+      <Card style={{ gap: 12 }}>
+        <SectionHeading title="Workspace" />
+        <Text style={s.muted}>
+          {workspace.profile.email} ·{" "}
+          {workspace.mode === "sample" ? "Local workspace" : "Live workspace"}
+        </Text>
+        <Button icon={LogOut} onPress={() => logout()}>
+          Sign out
+        </Button>
+        <Text style={s.small}>
+          Signing out ends this session on the server. Your workspace data stays saved.
+        </Text>
+      </Card>
     </View>
   );
 }

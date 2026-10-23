@@ -8,6 +8,9 @@ import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
 import type { Files } from "./files.ts";
 
+/** Neutral page standby browsers wait on: public, tiny, fast, cookie-free. */
+export const STANDBY_URL = "https://example.com/";
+
 const sessionSchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -40,6 +43,9 @@ function assertSessionId(id: string): void {
 export class BrowserService {
   private readonly queues = new Map<string, Promise<unknown>>();
   private health?: { checkedAt: number; reachable: Promise<boolean> };
+  /** Pre-warmed worker session ids with no owner yet, ready for instant handoff. */
+  private readonly standby = new Set<string>();
+  private fillTask: Promise<void> | null = null;
   constructor(
     private readonly db: Store,
     private readonly config: Config,
@@ -47,6 +53,43 @@ export class BrowserService {
     private readonly files: Files,
     private readonly now: () => number = Date.now,
   ) {}
+  private standbyTarget(): number {
+    return this.config.standbySessions ?? 1;
+  }
+  /**
+   * Fill the standby pool: live browsers on a neutral page, handed out by the
+   * next create() so opening skips the Chromium launch. Best-effort — any
+   * worker failure just leaves the pool empty and create() launches normally.
+   */
+  async warmStandby(): Promise<void> {
+    await this.fillStandby();
+  }
+  /** Pooled session ids (read-only copy, for tests and ops). */
+  standbyIds(): string[] {
+    return [...this.standby];
+  }
+  private fillStandby(): Promise<void> {
+    // Concurrent callers share one fill: a second warmup while the boot
+    // warmup is still launching waits for it instead of skipping the pool.
+    if (!this.fillTask) {
+      this.fillTask = this.fillOwned().finally(() => {
+        this.fillTask = null;
+      });
+    }
+    return this.fillTask;
+  }
+  private async fillOwned(): Promise<void> {
+    while (this.standby.size < this.standbyTarget()) {
+      if (!this.config.workerUrl || !this.config.workerToken) return;
+      const id = randomUUID();
+      try {
+        await this.request("/sessions", { id, url: STANDBY_URL }, undefined, 120_000);
+      } catch {
+        return;
+      }
+      this.standby.add(id);
+    }
+  }
   /** Whether the configured worker answers its health check, cached briefly for snapshots. */
   reachable(): Promise<boolean> {
     if (!this.config.workerUrl || !this.config.workerToken) return Promise.resolve(false);
@@ -70,11 +113,18 @@ export class BrowserService {
       if (this.queues.get(id) === next) this.queues.delete(id);
     }
   }
-  private async request(path: string, body?: unknown, signal?: AbortSignal) {
+  private async request(path: string, body?: unknown, signal?: AbortSignal, timeoutMs = 45_000) {
     signal?.throwIfAborted();
     if (!this.config.workerUrl || !this.config.workerToken)
       throw new AppError("Browser worker is not configured. Start it using the setup guide.", 503);
     let response: Response;
+    // timeoutMs 0 means no client-side timeout: long-lived streams end when
+    // the caller's signal aborts (viewer disconnect).
+    const timeout = timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined;
+    const combined =
+      signal && timeout
+        ? AbortSignal.any([signal, timeout])
+        : (signal ?? timeout);
     try {
       response = await fetch(`${this.config.workerUrl}${path}`, {
         method: body === undefined ? "GET" : "POST",
@@ -83,9 +133,7 @@ export class BrowserService {
           "Content-Type": "application/json",
         },
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: signal
-          ? AbortSignal.any([signal, AbortSignal.timeout(45000)])
-          : AbortSignal.timeout(45000),
+        signal: combined,
       });
     } catch {
       signal?.throwIfAborted();
@@ -116,6 +164,7 @@ export class BrowserService {
       ...session,
       consoleUrl: this.auth.sign(owner, `/api/browsers/${session.id}/console`),
       previewUrl: this.auth.sign(owner, `/api/browsers/${session.id}/preview`),
+      streamUrl: this.auth.sign(owner, `/api/browsers/${session.id}/stream`),
     };
   }
   private async save(owner: string, payload: unknown, expectedId: string) {
@@ -126,7 +175,26 @@ export class BrowserService {
     return this.decorate(owner, session);
   }
   async create(owner: string, url: string, signal?: AbortSignal) {
-    const id = randomUUID();
+    signal?.throwIfAborted();
+    // Hand out a pre-warmed standby session when one is ready: its browser is
+    // already running, so opening skips the Chromium launch entirely. Stale
+    // ids (worker restart, idle sweep) fall through to a normal launch.
+    for (const id of this.standby) {
+      this.standby.delete(id);
+      try {
+        const session = await this.adopt(owner, id, url, signal);
+        void this.fillStandby();
+        return session;
+      } catch {
+        // Aborted turns still surface below via the fresh launch path.
+        signal?.throwIfAborted();
+      }
+    }
+    const session = await this.adopt(owner, randomUUID(), url, signal);
+    void this.fillStandby();
+    return session;
+  }
+  private async adopt(owner: string, id: string, url: string, signal?: AbortSignal) {
     // Record ownership before calling the worker, including when its response is lost.
     await this.db.put(owner, "browsers", {
       id,
@@ -141,7 +209,9 @@ export class BrowserService {
     const value = await this.get(owner, id);
     const target = url ?? value.url;
     try {
-      const response = await this.request("/sessions", { id, url: target }, signal);
+      // Opening a session launches Chromium (up to 25s) then navigates (up to
+      // 45s), so this path gets a longer budget than quick reads and inputs.
+      const response = await this.request("/sessions", { id, url: target }, signal, 120_000);
       return await this.save(owner, await response.json(), id);
     } catch (error) {
       signal?.throwIfAborted();
@@ -193,15 +263,36 @@ export class BrowserService {
   }
   async observeForThread(owner: string, threadId: string, url: string, signal?: AbortSignal) {
     signal?.throwIfAborted();
-    // Persist the association before contacting the worker so failed/lost responses
-    // and later chat turns keep using the same profile instead of exhausting its limit.
-    const association =
-      (await this.db.get<ChatBrowser>(owner, "chat-browsers", threadId)) ??
-      (await this.db.insertIfAbsent(owner, "chat-browsers", {
-        id: threadId,
-        sessionId: randomUUID(),
-      })) ??
-      (await this.db.get<ChatBrowser>(owner, "chat-browsers", threadId));
+    // Fast path: a brand-new chat thread claims a pre-warmed standby session
+    // so the first chat browse skips the Chromium launch, just like create().
+    // Existing threads keep their pinned profile; stale ids fall through to a
+    // normal launch inside openOwned.
+    let association = await this.db.get<ChatBrowser>(owner, "chat-browsers", threadId);
+    if (!association) {
+      for (const pooledId of [...this.standby]) {
+        this.standby.delete(pooledId);
+        const claimed =
+          (await this.db.insertIfAbsent(owner, "chat-browsers", {
+            id: threadId,
+            sessionId: pooledId,
+          })) ?? (await this.db.get<ChatBrowser>(owner, "chat-browsers", threadId));
+        if (!claimed) continue;
+        if (claimed.sessionId !== pooledId) {
+          // Lost the thread race after popping a pooled id: hand it back.
+          this.standby.add(pooledId);
+        }
+        association = claimed;
+        break;
+      }
+      association ??=
+        (await this.db.insertIfAbsent(owner, "chat-browsers", {
+          id: threadId,
+          sessionId: randomUUID(),
+        })) ?? (await this.db.get<ChatBrowser>(owner, "chat-browsers", threadId));
+      // Refill in the background whether we handed out a pooled browser or
+      // launched fresh with an empty pool, mirroring create().
+      if (association) void this.fillStandby();
+    }
     if (!association) throw new AppError("Could not reserve the chat browser session", 500);
     const id = association.sessionId;
     await this.db.insertIfAbsent(owner, "browsers", {
@@ -213,16 +304,26 @@ export class BrowserService {
     });
     return this.serial(id, async () => {
       signal?.throwIfAborted();
+      // A failed open leaves no live browser behind, so its error carries no
+      // session id. A failed read does: the session is still alive on the
+      // worker (e.g. sitting on an anti-bot challenge page). Carry its id so
+      // the client can offer Take control instead of a dead-end error.
       await this.openOwned(owner, id, url, signal);
       signal?.throwIfAborted();
-      const page = await this.readOwned(owner, id, signal);
-      signal?.throwIfAborted();
-      return {
-        sessionId: id,
-        ...page,
-        text: page.text.slice(0, 30_000),
-        truncated: page.truncated || page.text.length > 30_000,
-      };
+      try {
+        const page = await this.readOwned(owner, id, signal);
+        signal?.throwIfAborted();
+        return {
+          sessionId: id,
+          ...page,
+          text: page.text.slice(0, 30_000),
+          truncated: page.truncated || page.text.length > 30_000,
+        };
+      } catch (error) {
+        throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
+          browserSessionId: id,
+        });
+      }
     });
   }
   async close(owner: string, id: string) {
@@ -238,6 +339,18 @@ export class BrowserService {
   async preview(owner: string, id: string) {
     await this.get(owner, id);
     return this.request(`/sessions/${encodeURIComponent(id)}/screenshot`);
+  }
+  /** Long-lived MJPEG screencast; ends when signal aborts (viewer disconnect). */
+  async stream(owner: string, id: string, signal?: AbortSignal) {
+    await this.get(owner, id);
+    return this.request(`/sessions/${encodeURIComponent(id)}/stream`, undefined, signal, 0);
+  }
+  /** Hover pointer fast path: no serial queue, no session save — cursor stays live. */
+  async move(owner: string, id: string, value: unknown) {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new AppError("A JSON object is required for browser input", 422);
+    await this.get(owner, id);
+    return (await this.request(`/sessions/${encodeURIComponent(id)}/move`, value)).json();
   }
   async input(owner: string, id: string, value: unknown) {
     if (!value || typeof value !== "object" || Array.isArray(value))
@@ -290,6 +403,6 @@ export class BrowserService {
     return { files: saved, failures };
   }
   console(owner: string, id: string) {
-    return browserConsole(this.auth.sign(owner, `/api/browsers/${id}/preview`));
+    return browserConsole(this.auth.sign(owner, `/api/browsers/${id}/stream`));
   }
 }

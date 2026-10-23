@@ -1,7 +1,9 @@
-import { useCallback, useState } from "react";
-import { Linking, Text, type TextStyle } from "react-native";
+import { Square, Volume2 } from "lucide-react-native";
+import { useCallback, useEffect, useState } from "react";
+import { Linking, Pressable, Text, type TextStyle, View } from "react-native";
 import Markdown, { type MarkdownStyles, type RenderRules } from "react-native-markdown-renderer";
 import { assistantMarkdown, isSafeAssistantUrl } from "./assistant-markdown";
+import { isSpeechSupported, speakMarkdown, stopSpeaking } from "./speech";
 import { colors, ErrorNotice } from "./ui";
 
 const textStyle = { color: colors.text, fontSize: 16, lineHeight: 24 };
@@ -39,6 +41,8 @@ const rules: RenderRules = {
 
 export function AssistantResponse({ content }: { content: string }) {
   const [linkError, setLinkError] = useState("");
+  const [speaking, setSpeaking] = useState(false);
+  const [speechOffered] = useState(() => isSpeechSupported());
   const onLinkPress = useCallback((url: string) => {
     if (!isSafeAssistantUrl(url)) return false;
     setLinkError("");
@@ -47,6 +51,18 @@ export function AssistantResponse({ content }: { content: string }) {
     );
     return false;
   }, []);
+  // A new reply elsewhere takes the voice: stop this one when it unmounts.
+  useEffect(() => () => stopSpeaking(), []);
+  const toggleSpeech = useCallback(() => {
+    if (speaking) {
+      stopSpeaking();
+      setSpeaking(false);
+      return;
+    }
+    stopSpeaking();
+    speakMarkdown(content, () => setSpeaking(false));
+    setSpeaking(true);
+  }, [content, speaking]);
   return (
     <>
       <Markdown
@@ -57,6 +73,29 @@ export function AssistantResponse({ content }: { content: string }) {
       >
         {content}
       </Markdown>
+      {speechOffered && (
+        <View style={{ flexDirection: "row", justifyContent: "flex-end", marginTop: 2 }}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={speaking ? "Stop reading aloud" : "Read reply aloud"}
+            onPress={toggleSpeech}
+            style={({ pressed }) => ({
+              width: 32,
+              height: 32,
+              alignItems: "center",
+              justifyContent: "center",
+              borderRadius: 16,
+              backgroundColor: speaking ? "#FDE8E8" : pressed ? "#E2E4E7" : "transparent",
+            })}
+          >
+            {speaking ? (
+              <Square size={13} fill={colors.muted} strokeWidth={0} />
+            ) : (
+              <Volume2 size={17} strokeWidth={1.8} color={colors.muted} />
+            )}
+          </Pressable>
+        </View>
+      )}
       <ErrorNotice error={linkError} />
     </>
   );

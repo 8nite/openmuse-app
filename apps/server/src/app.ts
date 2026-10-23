@@ -6,8 +6,10 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { z } from "zod";
+import type { AgentTask } from "../../../packages/domain/src/agent.ts";
 import {
   calendarRangeSchema,
+  type DeviceAction,
   emailDraftSchema,
   proposalSchema,
 } from "../../../packages/domain/src/index.ts";
@@ -19,12 +21,16 @@ import { ComputerService, type DockerRunner } from "./computer.ts";
 import { computerRoutes } from "./computer-routes.ts";
 import { assertApiDeploymentConfig, type Config } from "./config.ts";
 import type { Store } from "./db.ts";
+import { DeviceService } from "./device.ts";
+import { DeviceRelay } from "./device-relay.ts";
+import { pushConfigured } from "./engine/push.ts";
 import { agentRoutes } from "./engine/routes.ts";
 import { AgentService } from "./engine/service.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import { rateLimit } from "./rate-limit.ts";
+import { transcribeAudio, voiceConfigured } from "./voice.ts";
 import { WorkspaceService } from "./workspace.ts";
 
 export async function createApp(
@@ -37,16 +43,104 @@ export async function createApp(
     files = new Files(db, config, auth),
     google = new GoogleAuth(db, config),
     workspace = new WorkspaceService(db, config, files, google);
+  const browser = new BrowserService(db, config, auth, files);
+  // Pre-warm standby browsers in the background; boot does not wait for them.
+  void browser.warmStandby().catch(() => {});
+  const relay = new DeviceRelay();
+  const device = new DeviceService(db, config, auth, Date.now, relay);
+  const computer = new ComputerService(db, config, options.docker);
+
+  async function executeDeviceAction(
+    owner: string,
+    data: DeviceAction,
+    taskId?: string,
+  ): Promise<string> {
+    device.ensureEnabled();
+    // Resolve the session: explicit id first, then the task's phone, then a fresh launch.
+    let sessionId = data.sessionId;
+    if (!sessionId && taskId) {
+      const task = await db.get<{ state?: { deviceId?: unknown } }>(owner, "tasks", taskId);
+      if (typeof task?.state?.deviceId === "string") sessionId = task.state.deviceId;
+    }
+    let launched = false;
+    if (!sessionId) {
+      const target =
+        data.action.type === "launch" ? (data.action.intentUri ?? data.intentUri) : data.intentUri;
+      if (!target)
+        throw new AppError("Open the phone on a link or app first, or pass its sessionId", 422);
+      sessionId = (await device.create(owner, target)).id;
+      launched =
+        data.action.type === "launch" && (data.action.intentUri ?? data.intentUri) === target;
+    }
+    const session = await device.get(owner, sessionId);
+    const before = await device.read(owner, sessionId);
+    const beforeText = (before.text ?? "").slice(0, 500);
+    if (data.action.type === "launch" && !launched) {
+      const target = data.action.intentUri ?? data.intentUri;
+      if (!target) throw new AppError("A launch needs the link or app address to open", 422);
+      await device.launch(owner, sessionId, target);
+    } else if (data.action.type !== "launch") {
+      await device.input(owner, sessionId, data.action);
+    }
+    const after = await device.read(owner, sessionId);
+    let screenshot = false;
+    try {
+      await (await device.preview(owner, sessionId)).arrayBuffer();
+      screenshot = true;
+    } catch {
+      screenshot = false;
+    }
+    const afterText = (after.text ?? "").slice(0, 500);
+    const label =
+      data.action.type === "launch"
+        ? `open ${data.action.intentUri ?? data.intentUri ?? session.packageOrUrl}`
+        : data.action.type === "tap"
+          ? `tap ${data.action.x},${data.action.y}`
+          : data.action.type === "swipe"
+            ? `swipe ${data.action.x1},${data.action.y1} to ${data.action.x2},${data.action.y2}`
+            : data.action.type === "text"
+              ? `type ${data.action.text.slice(0, 40)}`
+              : `press ${data.action.key}`;
+    if (taskId) {
+      const task = await db.get<AgentTask>(owner, "tasks", taskId);
+      if (task) {
+        const at = new Date().toISOString();
+        await db.put(owner, "tasks", {
+          ...task,
+          evidence: [
+            ...task.evidence,
+            {
+              id: randomUUID(),
+              kind: "device",
+              title: `Phone before ${label}`,
+              excerpt: `${session.title} · ${session.packageOrUrl}\n${beforeText || "(empty screen)"}${before.mediaState ? `\nMedia: ${before.mediaState}` : ""}`,
+              url: session.packageOrUrl,
+            },
+            {
+              id: randomUUID(),
+              kind: "device",
+              title: `Phone after ${label}`,
+              excerpt: `${afterText || "(empty screen)"}${after.mediaState ? `\nMedia: ${after.mediaState}` : ""}\nScreenshot ${screenshot ? "confirmed" : "unavailable"} · session ${sessionId}`,
+              url: session.packageOrUrl,
+            },
+          ],
+          updatedAt: at,
+        });
+      }
+    }
+    return `Phone ${label} done · session ${sessionId} · now showing: ${afterText.slice(0, 160) || "(empty screen)"}`;
+  }
+
   const actions = new ActionService(db, {
-    execute: (owner, input, connectionId, targetVersion) =>
-      workspace.execute(owner, input, connectionId, targetVersion),
+    execute: (owner, input, connectionId, targetVersion, taskId) =>
+      input.kind === "device.action"
+        ? executeDeviceAction(owner, input.data, taskId)
+        : workspace.execute(owner, input, connectionId, targetVersion),
     prepare: (owner, input, connectionId) => workspace.prepare(owner, input, connectionId),
     connected: (owner) => workspace.connected(owner),
     connection: (owner) => workspace.connection(owner),
   });
-  const browser = new BrowserService(db, config, auth, files);
-  const computer = new ComputerService(db, config, options.docker);
-  const agent = new AgentService(db, config, workspace, files, actions, browser, computer);
+  const agent = new AgentService(db, config, workspace, files, actions, browser, computer, device);
   const intelligence = new CopilotKitIntelligence({ apiKey: config.intelligenceApiKey });
   const runtime = makeRuntime(config, agent, auth, intelligence);
   const app = new Hono<{ Variables: { owner: string } }>();
@@ -72,7 +166,8 @@ export async function createApp(
     "*",
     bodyLimit({
       maxSize: 12 * 1024 * 1024,
-      onError: (c) => c.json({ error: "Request is too large; PDFs must be 10 MB or smaller" }, 413),
+      onError: (c) =>
+        c.json({ error: "Request is too large; files must be 10 MB or smaller" }, 413),
     }),
   );
   app.use("/api/*", rateLimit(Boolean(config.trustProxy)));
@@ -101,6 +196,11 @@ export async function createApp(
       mode: config.mode,
       agentConfigured: agentConfigured(config),
       browserConfigured: Boolean(config.workerUrl && config.workerToken),
+      deviceConfigured: Boolean(
+        config.deviceEnabled && config.deviceWorkerUrl && config.workerToken,
+      ),
+      voiceConfigured: voiceConfigured(),
+      pushConfigured: pushConfigured(config),
     }),
   );
   let loginWindow = 0,
@@ -113,11 +213,24 @@ export async function createApp(
     if (++loginAttempts > 30)
       throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
     const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
-    const session = await auth.session(body.accessKey);
-    await workspace.ensureSample("local-user", actions);
-    await agent.ensure("local-user");
-    if (config.mode === "sample") await agent.refreshIdeas("local-user");
+    // Per-passkey isolation behind the auth gateway: the gateway injects
+    // x-openmuse-device from the verified passkey session. Each device gets
+    // its own owner (gw-<deviceId>) so workspaces/sessions never cross.
+    // Direct localhost access has no header and keeps the legacy local-user.
+    const rawDevice = c.req.header("x-openmuse-device") ?? c.req.header("X-OpenMuse-Device") ?? "";
+    const owner = /^[A-Za-z0-9_-]{1,64}$/.test(rawDevice) ? `gw-${rawDevice}` : "local-user";
+    const session = await auth.session(body.accessKey, owner);
+    await workspace.ensureSample(owner, actions);
+    await agent.ensure(owner);
+    if (config.mode === "sample") await agent.refreshIdeas(owner);
     return c.json(session);
+  });
+  // Idempotent sign-out: succeeds even without a valid token so the client
+  // can always clear its local state. Registered before the auth middleware
+  // like sign-in, since there may be no valid session left to check.
+  app.post("/api/session/revoke", async (c) => {
+    await auth.revoke(c.req.header("authorization"));
+    return c.json({ ok: true });
   });
   app.get("/api/google/callback", async (c) => {
     if (c.req.query("error"))
@@ -132,7 +245,7 @@ export async function createApp(
   });
   app.use("/api/*", async (c, next) => {
     const signedRoute =
-      /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$/.test(
+      /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console|stream)$|^\/api\/devices\/[^/]+\/(?:preview|console)$/.test(
         c.req.path,
       );
     const owner =
@@ -143,17 +256,21 @@ export async function createApp(
     await next();
   });
   app.get("/api/workspace", async (c) => {
-    const [snapshot, reachable] = await Promise.all([
+    const [snapshot, reachable, deviceReachable] = await Promise.all([
       workspace.snapshot(c.get("owner"), c.req.query("q")),
       browser.reachable(),
+      device.reachableFor(c.get("owner")),
     ]);
     snapshot.browsers = snapshot.browsers.map((s) => browser.decorate(c.get("owner"), s));
+    snapshot.devices = snapshot.devices.map((s) => device.decorate(c.get("owner"), s));
     // A configured worker that does not answer is offline, not ready.
-    snapshot.connections = snapshot.connections.map((connection) =>
-      connection.id === "browser" && connection.status === "connected" && !reachable
-        ? { ...connection, status: "unavailable" }
-        : connection,
-    );
+    snapshot.connections = snapshot.connections.map((connection) => {
+      if (connection.id === "browser" && connection.status === "connected" && !reachable)
+        return { ...connection, status: "unavailable" };
+      if (connection.id === "device" && connection.status === "connected" && !deviceReachable)
+        return { ...connection, status: "unavailable" };
+      return connection;
+    });
     return c.json(snapshot);
   });
   app.route("/api/agent", agentRoutes(agent));
@@ -241,22 +358,45 @@ export async function createApp(
   app.post("/api/files", async (c) => {
     const data = await c.req.parseBody();
     const file = data.file;
-    if (!(file instanceof File)) throw new AppError("Choose a PDF file");
+    if (!(file instanceof File)) throw new AppError("Choose a file to upload");
+    // Chat composer tags its uploads so Files stays a library instead of
+    // crowding with every chat attachment. Default keeps old clients working.
+    const rawSource =
+      (typeof data.source === "string" ? data.source : undefined) ?? c.req.query("source");
+    const source = (rawSource ?? "").trim().slice(0, 120) || "Uploaded by you";
     return c.json(
       await files.import(
         c.get("owner"),
         file.name,
         new Uint8Array(await file.arrayBuffer()),
-        "Uploaded by you",
+        source,
+        undefined,
+        undefined,
+        file.type || "application/octet-stream",
       ),
       201,
     );
   });
   app.get("/api/files/:id/content", async (c) => {
     const file = await files.get(c.get("owner"), c.req.param("id"));
-    c.header("Content-Type", "application/pdf");
+    c.header("Content-Type", file.mimeType || "application/octet-stream");
     c.header("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(file.name)}`);
     return c.body(await files.bytes(c.get("owner"), file.id));
+  });
+  app.post("/api/voice/transcribe", async (c) => {
+    const data = await c.req.parseBody();
+    const audio = data.audio;
+    if (!(audio instanceof File)) throw new AppError("Choose an audio recording to transcribe", 422);
+    return c.json(
+      {
+        text: await transcribeAudio(
+          new Uint8Array(await audio.arrayBuffer()),
+          audio.type || "application/octet-stream",
+          audio.name || "recording.m4a",
+        ),
+      },
+      200,
+    );
   });
   app.post("/api/files/:id/fill", async (c) => {
     const body = z
@@ -317,6 +457,22 @@ export async function createApp(
     c.header("Content-Type", "image/png");
     return c.body(await response.arrayBuffer());
   });
+  app.get("/api/browsers/:id/stream", async (c) => {
+    const upstream = await browser.stream(
+      c.get("owner"),
+      c.req.param("id"),
+      // Viewer disconnect aborts the worker screencast.
+      c.req.raw.signal,
+    );
+    return new Response(upstream.body, {
+      headers: {
+        "Content-Type":
+          upstream.headers.get("content-type") ?? "multipart/x-mixed-replace; boundary=openmuse-frame",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  });
   app.get("/api/browsers/:id/console", async (c) => {
     await browser.get(c.get("owner"), c.req.param("id"));
     c.header(
@@ -326,7 +482,62 @@ export async function createApp(
     return c.html(browser.console(c.get("owner"), c.req.param("id")));
   });
   app.post("/api/browsers/:id/console", async (c) => {
-    await browser.input(c.get("owner"), c.req.param("id"), await c.req.json());
+    const body = await c.req.json();
+    // Takeover navigation from the console address bar shares the signed
+    // console auth, so the user can go to a specific URL without leaving control.
+    if (body && typeof body === "object" && typeof body.url === "string") {
+      const { url } = z.object({ url: z.url().max(4096) }).parse(body);
+      return c.json(await browser.navigate(c.get("owner"), c.req.param("id"), url));
+    }
+    // Hover moves bypass the serial queue so the remote cursor follows live;
+    // held-drag moves stay ordered with down/up through the normal input path.
+    if (body && typeof body === "object" && body.type === "move" && body.held !== true) {
+      return c.json(await browser.move(c.get("owner"), c.req.param("id"), body));
+    }
+    await browser.input(c.get("owner"), c.req.param("id"), body);
+    return c.json({ ok: true });
+  });
+  app.post("/api/devices/pair", async (c) => c.json(await device.pair(c.get("owner")), 201));
+  app.post("/api/devices/register", async (c) => {
+    const body = z.object({ code: z.string().min(1).max(256) }).parse(await c.req.json());
+    return c.json(await device.register(body.code, c.get("owner")), 201);
+  });
+  app.post("/api/devices", async (c) => {
+    const body = z.object({ packageOrUrl: z.string().min(1).max(4096) }).parse(await c.req.json());
+    return c.json(await device.create(c.get("owner"), body.packageOrUrl), 201);
+  });
+  app.get("/api/devices/:id", async (c) => {
+    const owner = c.get("owner");
+    return c.json(device.decorate(owner, await device.get(owner, c.req.param("id"))));
+  });
+  app.post("/api/devices/:id/launch", async (c) => {
+    const body = z.object({ intentUri: z.string().min(1).max(4096) }).parse(await c.req.json());
+    return c.json(await device.launch(c.get("owner"), c.req.param("id"), body.intentUri));
+  });
+  app.post("/api/devices/:id/input", async (c) =>
+    c.json(await device.input(c.get("owner"), c.req.param("id"), await c.req.json())),
+  );
+  app.get("/api/devices/:id/read", async (c) =>
+    c.json(await device.read(c.get("owner"), c.req.param("id"))),
+  );
+  app.post("/api/devices/:id/close", async (c) =>
+    c.json(await device.close(c.get("owner"), c.req.param("id"))),
+  );
+  app.get("/api/devices/:id/preview", async (c) => {
+    const response = await device.preview(c.get("owner"), c.req.param("id"));
+    c.header("Content-Type", "image/png");
+    return c.body(await response.arrayBuffer());
+  });
+  app.get("/api/devices/:id/console", async (c) => {
+    await device.get(c.get("owner"), c.req.param("id"));
+    c.header(
+      "Content-Security-Policy",
+      "default-src 'self'; img-src 'self' blob:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+    );
+    return c.html(device.console(c.get("owner"), c.req.param("id")));
+  });
+  app.post("/api/devices/:id/console", async (c) => {
+    await device.input(c.get("owner"), c.req.param("id"), await c.req.json());
     return c.json({ ok: true });
   });
   app.all("/api/copilotkit/*", async (c) => {
@@ -350,5 +561,5 @@ export async function createApp(
   app.get("/", (c) =>
     c.json({ name: "OpenMuse", app: "http://localhost:8081", health: "/api/health" }),
   );
-  return { app, auth, files, actions, workspace, agent, computer };
+  return { app, auth, files, actions, workspace, agent, computer, device, relay, browser };
 }

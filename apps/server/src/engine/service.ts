@@ -20,6 +20,7 @@ import type {
   ActionProposal,
   Artifact,
   BrowserSession,
+  DeviceSession,
   Mail,
   ProposalInput,
 } from "../../../../packages/domain/src/index.ts";
@@ -28,6 +29,7 @@ import type { BrowserService } from "../browser.ts";
 import { ComputerService } from "../computer.ts";
 import type { Config } from "../config.ts";
 import type { Store } from "../db.ts";
+import type { DeviceService } from "../device.ts";
 import { AppError } from "../errors.ts";
 import type { Files } from "../files.ts";
 import { backgroundFailure } from "../log.ts";
@@ -42,6 +44,7 @@ import {
   pageLines,
   withoutRelativeTimes,
 } from "./page-diff.ts";
+import { sendPush } from "./push.ts";
 import { LostLeaseError, type TaskContext, TaskWorker } from "./worker.ts";
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -62,6 +65,7 @@ export class AgentService {
     readonly actions: ActionService,
     readonly browser: BrowserService,
     readonly computer: ComputerService = new ComputerService(db, config),
+    readonly device?: DeviceService,
   ) {
     this.search = new SearchService(db);
     this.worker = new TaskWorker(db, (owner, task, context) => this.execute(owner, task, context), {
@@ -177,10 +181,14 @@ export class AgentService {
     const browsers = (await this.db.list<BrowserSession>(owner, "browsers")).filter((browser) =>
       [task.state.browserId, task.state.sessionId].includes(browser.id),
     );
+    const devices = (await this.db.list<DeviceSession>(owner, "devices")).filter((device) =>
+      [task.state.deviceId, task.state.sessionId].includes(device.id),
+    );
     return {
       task,
       files: files.map((file) => this.files.signed(owner, file)),
       browsers: browsers.map((browser) => this.browser.decorate(owner, browser)),
+      devices,
       events: (await this.db.list<RunEvent>(owner, "run-events"))
         .filter((e) => e.taskId === id)
         .sort((a, b) => a.date.localeCompare(b.date)),
@@ -726,6 +734,8 @@ export class AgentService {
       read: false,
     };
     await this.db.insertIfAbsent(owner, "notifications", value);
+    // Closed-app delivery. Fire-and-forget: the inbox row above is the record of truth.
+    void sendPush(this.config, this.db, owner, title, body).catch(() => {});
   }
   mailEvidence(mail: Mail): Evidence {
     return { id: mail.id, kind: "mail", title: mail.subject, excerpt: mail.body.slice(0, 400) };
@@ -759,12 +769,15 @@ export class AgentService {
     context: TaskContext,
   ) {
     await context.guard();
-    const connection = await this.workspace.connection(owner);
-    if (connection?.id !== task.state.connectionId)
-      throw new AppError(
-        "Google connection changed during this task. Start a new task using the current account.",
-        409,
-      );
+    // Phone actions are account-independent; Google-backed proposals still pin the account.
+    if (input.kind !== "device.action") {
+      const connection = await this.workspace.connection(owner);
+      if (connection?.id !== task.state.connectionId)
+        throw new AppError(
+          "Google connection changed during this task. Start a new task using the current account.",
+          409,
+        );
+    }
     const proposal = await this.actions.propose(owner, input, `${task.id}:${key}`, task.id);
     if (proposal.status === "succeeded") return proposal;
     if (proposal.status !== "awaiting_review" && proposal.status !== "executing")

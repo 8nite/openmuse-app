@@ -108,6 +108,74 @@ test("browser worker URL keeps an existing scheme and adds http to host:port", (
   assert.equal(browserWorkerUrl("openmuse-browser-h4fx:8790"), "http://openmuse-browser-h4fx:8790");
 });
 
+test("computer network egress defaults to disabled and validates its flag", async () => {
+  const { readConfig } = await import("../apps/server/src/config.ts");
+  const keys = ["COMPUTER_NETWORK", "CPK_INTELLIGENCE_API_KEY"];
+  const old = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
+    delete process.env.COMPUTER_NETWORK;
+    assert.equal(readConfig().computerNetwork, "disabled");
+    process.env.COMPUTER_NETWORK = "enabled";
+    assert.equal(readConfig().computerNetwork, "enabled");
+    process.env.COMPUTER_NETWORK = "bridge";
+    assert.throws(() => readConfig(), /COMPUTER_NETWORK/);
+  } finally {
+    for (const [key, value] of Object.entries(old)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("standby browsers default to one and clamp to none through three", () => {
+  const keys = ["BROWSER_STANDBY_SESSIONS", "CPK_INTELLIGENCE_API_KEY"];
+  const old = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
+    delete process.env.BROWSER_STANDBY_SESSIONS;
+    assert.equal(readConfig().standbySessions, 1);
+    process.env.BROWSER_STANDBY_SESSIONS = "2";
+    assert.equal(readConfig().standbySessions, 2);
+    process.env.BROWSER_STANDBY_SESSIONS = "0";
+    assert.equal(readConfig().standbySessions, 0);
+    process.env.BROWSER_STANDBY_SESSIONS = "9";
+    assert.equal(readConfig().standbySessions, 3);
+    process.env.BROWSER_STANDBY_SESSIONS = "many";
+    assert.equal(readConfig().standbySessions, 0);
+  } finally {
+    for (const [key, value] of Object.entries(old)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("sample workspace stays loopback-only unless explicitly opted out for a gateway", async () => {
+  const { readConfig } = await import("../apps/server/src/config.ts");
+  const keys = ["WORKSPACE_MODE", "HOST", "SAMPLE_ALLOW_NON_LOOPBACK", "CPK_INTELLIGENCE_API_KEY"];
+  const old = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
+    process.env.WORKSPACE_MODE = "sample";
+    process.env.HOST = "0.0.0.0";
+    delete process.env.SAMPLE_ALLOW_NON_LOOPBACK;
+    assert.throws(() => readConfig(), /loopback/);
+    process.env.SAMPLE_ALLOW_NON_LOOPBACK = "false";
+    assert.throws(() => readConfig(), /loopback/);
+    process.env.SAMPLE_ALLOW_NON_LOOPBACK = "true";
+    assert.equal(readConfig().host, "0.0.0.0");
+    process.env.HOST = "127.0.0.1";
+    delete process.env.SAMPLE_ALLOW_NON_LOOPBACK;
+    assert.equal(readConfig().host, "127.0.0.1");
+  } finally {
+    for (const [key, value] of Object.entries(old)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test("environment variables that override a different .env value are reported by name", () => {
   const file = { OPENAI_API_KEY: "sk-or-file", MODEL: "openai/gpt-5", PORT: "8787", EMPTY: "" };
   const env = { OPENAI_API_KEY: "sk-proj-system", MODEL: "openai/gpt-5", EMPTY: "set" };

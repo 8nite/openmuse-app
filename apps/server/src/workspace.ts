@@ -6,6 +6,7 @@ import type {
   Artifact,
   BrowserSession,
   CalendarEvent,
+  DeviceSession,
   Mail,
   ProposalInput,
   Workspace,
@@ -331,6 +332,7 @@ export class WorkspaceService {
       events: events.sort((a, b) => a.start.localeCompare(b.start)),
       files: await this.files.list(owner),
       browsers: await this.db.list<BrowserSession>(owner, "browsers"),
+      devices: await this.db.list<DeviceSession>(owner, "devices"),
       actions: await this.db.list<ActionProposal>(owner, "actions"),
       activity: await this.db.list<ActivityEntry>(owner, "activity"),
       connections: [
@@ -352,6 +354,14 @@ export class WorkspaceService {
           name: "Browser",
           status: this.config.workerUrl && this.config.workerToken ? "connected" : "unconfigured",
           capabilities: ["Persistent sessions", "PDF downloads"],
+        },
+        {
+          id: "device",
+          name: "Phone",
+          // The server switch gates the tab; reachability (paired relay or HTTP
+          // fallback) downgrades connected to unavailable in app.ts.
+          status: !this.config.deviceEnabled ? "unconfigured" : "connected",
+          capabilities: ["Screenshot", "Tap and swipe", "YouTube launch"],
         },
         {
           id: "openbot",
@@ -390,6 +400,12 @@ export class WorkspaceService {
     };
   }
   async prepare(owner: string, input: ProposalInput, connectionId?: string) {
+    if (input.kind === "device.action") {
+      // Fail fast on a stale session; the approval executes against the live phone.
+      if (input.data.sessionId && !(await this.db.get(owner, "devices", input.data.sessionId)))
+        throw new AppError("Phone session not found. Open the phone again first.", 404);
+      return { input };
+    }
     if (input.kind === "email.send") {
       for (const id of input.data.attachmentIds) await this.files.get(owner, id);
       return { input };
@@ -414,6 +430,9 @@ export class WorkspaceService {
     connectionId?: string,
     targetVersion?: string,
   ): Promise<string> {
+    // Phone actions execute through the paired device worker, never here.
+    if (input.kind === "device.action")
+      throw new AppError("Phone actions run through the paired device worker", 400);
     if (this.config.mode === "sample") {
       if (input.kind === "email.send") {
         const id = randomUUID();

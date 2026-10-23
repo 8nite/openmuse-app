@@ -27,7 +27,7 @@ Rich tool messages retain task IDs. The renderer fetches current task status, br
 
 The API fails at startup with a missing-key error when the key is unset. Existing local sample history is not automatically uploaded to Intelligence.
 
-Automatic thread naming is disabled; conversations can be renamed in the menu. Intelligence is a separately configured service, not bundled with this MIT-licensed application. See [headless threads](https://docs.copilotkit.ai/headless-threads) for the platform lifecycle and hosting options.
+Automatic thread naming is enabled; side chats are titled from their first message. Conversations can still be renamed in the menu. Intelligence is a separately configured service, not bundled with this MIT-licensed application. See [headless threads](https://docs.copilotkit.ai/headless-threads) for the platform lifecycle and hosting options.
 
 ## Agent computer
 

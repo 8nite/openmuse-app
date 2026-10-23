@@ -529,11 +529,20 @@ test("the desktop stream URL is reused while serving and needs a running compute
 
 test("agent instructions stay provider-neutral and mention the desktop only when it exists", () => {
   assert.match(computerInstructions(), /Docker Linux container/);
+  assert.match(computerInstructions(), /Network access is disabled/);
   assert.doesNotMatch(computerInstructions(), /desktop tab/i);
   const desktop = computerInstructions("e2b-desktop");
   assert.match(desktop, /graphical Xfce desktop/);
   assert.match(desktop, /Desktop tab/);
   assert.doesNotMatch(desktop, /E2B|Docker/);
+});
+
+test("docker instructions describe terminal egress only when it is enabled", () => {
+  const online = computerInstructions("docker", "enabled");
+  assert.match(online, /Network access is enabled/);
+  assert.match(online, /never send, post, submit/);
+  assert.doesNotMatch(online, /Network access is disabled/);
+  assert.match(computerInstructions("docker", "disabled"), /Network access is disabled/);
 });
 
 test("a Stop between find and use fails the operation instead of resuming the box", async () => {

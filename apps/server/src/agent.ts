@@ -64,7 +64,7 @@ export function makeRuntime(
       id: await auth.owner(request.headers.get("authorization") ?? undefined),
       name: "OpenMuse user",
     }),
-    generateThreadNames: false,
+    generateThreadNames: true,
   });
   return createCopilotHonoHandler({ runtime, basePath: "/api/copilotkit" });
 }

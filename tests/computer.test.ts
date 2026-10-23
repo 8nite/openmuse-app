@@ -121,6 +121,55 @@ test("attaching an existing container fails closed on unsafe isolation or owner 
   }
 });
 
+test("terminal egress follows COMPUTER_NETWORK and fails closed on mismatch", async () => {
+  const enabled = { ...config, computerNetwork: "enabled" as const };
+  // Enabled: a bridge container attaches and reports network enabled.
+  const attached = fixture({
+    inspect: sandbox(true, "owner", "bridge"),
+    command: async () => ok("egress ok\n"),
+  });
+  const online = new ComputerService(db, enabled, attached.runner);
+  assert.equal((await online.snapshot("owner")).network, "enabled");
+  assert.equal(
+    (await online.execute("owner", { command: "git ls-remote https://github.com" })).status,
+    "succeeded",
+  );
+  // Enabled: a none container is refused, and disabled still reports disabled.
+  const stale = fixture({ inspect: sandbox(true, "owner", "none") });
+  await assert.rejects(
+    new ComputerService(db, enabled, stale.runner).execute("owner", { command: "pwd" }),
+    /isolation|ownership/,
+  );
+  assert.equal(
+    (await new ComputerService(db, config, fixture().runner).snapshot("owner")).network,
+    "disabled",
+  );
+});
+
+test("container creation passes the configured network mode", async () => {
+  for (const [overrides, expected] of [
+    [{}, "none"],
+    [{ computerNetwork: "enabled" as const }, "bridge"],
+  ] as const) {
+    const network = expected === "bridge" ? "bridge" : "none";
+    const calls: string[][] = [];
+    let created = false;
+    const service = new ComputerService(db, { ...config, ...overrides }, async (args, options) => {
+      calls.push(args);
+      if (args[0] === "container" && args[1] === "ls" && !created) return ok("");
+      if (args[0] === "container" && args[1] === "create") created = true;
+      return fixture({ inspect: sandbox(true, "owner", network) }).runner(args, options);
+    });
+    assert.equal((await service.start("owner")).status, "running");
+    const create = calls.find((args) => args[0] === "container" && args[1] === "create");
+    assert.ok(create);
+    assert.deepEqual(create.slice(create.indexOf("--network"), create.indexOf("--network") + 2), [
+      "--network",
+      expected,
+    ]);
+  }
+});
+
 test("paths cannot escape the workspace and file contents travel on stdin", async () => {
   const f = fixture({ command: async () => ok(JSON.stringify({ path: "/workspace/note.txt" })) });
   const service = new ComputerService(db, config, f.runner);

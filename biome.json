@@ -10,7 +10,8 @@
       "!**/ios",
       "!**/android",
       "!**/.openmuse",
-      "!**/artifacts"
+      "!**/artifacts",
+      "!apps/device-worker/**/build"
     ]
   },
   "formatter": { "enabled": true, "indentStyle": "space", "lineWidth": 100 },

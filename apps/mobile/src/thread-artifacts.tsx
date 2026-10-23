@@ -1,11 +1,11 @@
 import { ChevronRight, FileText } from "lucide-react-native";
 import { useEffect, useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import type { Artifact, BrowserSession } from "../../../packages/domain/src";
+import type { Artifact, BrowserSession, DeviceSession } from "../../../packages/domain/src";
 import type { AgentArtifact, AgentTask } from "../../../packages/domain/src/agent";
 import { ArtifactCard, TaskCard } from "./agent-ui";
-import { BrowserThreadCard } from "./computer";
-import { Button, Card, colors, ErrorNotice, s } from "./ui";
+import { BrowserThreadCard, DeviceThreadCard } from "./computer";
+import { Button, Card, colors, describeFile, ErrorNotice, fileKindLabel, s } from "./ui";
 import { useWorkspace } from "./workspace";
 
 export function FileThreadCard({ file }: { file: Artifact }) {
@@ -13,13 +13,13 @@ export function FileThreadCard({ file }: { file: Artifact }) {
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={`Open PDF: ${file.name}`}
+      accessibilityLabel={`Open file: ${file.name}`}
       onPress={() => open({ type: "file", file })}
       style={{ width: "100%", maxWidth: 440 }}
     >
       <Card style={{ padding: 18, backgroundColor: "#F0F1F2", gap: 18 }}>
         <View style={{ borderRadius: 12, padding: 22, backgroundColor: "#FFF", gap: 14 }}>
-          <Text style={[s.heading, { fontSize: 18 }]}>{file.name.replace(/\.pdf$/i, "")}</Text>
+          <Text style={[s.heading, { fontSize: 18 }]}>{file.name}</Text>
           {file.fields?.length ? (
             file.fields.slice(0, 4).map((field) => (
               <View
@@ -38,9 +38,7 @@ export function FileThreadCard({ file }: { file: Artifact }) {
               </View>
             ))
           ) : (
-            <Text style={s.muted}>
-              {file.pageCount} {file.pageCount === 1 ? "page" : "pages"} · Tap to read the document
-            </Text>
+            <Text style={s.muted}>{describeFile(file)} · Tap to open</Text>
           )}
         </View>
         <View style={[s.row, { gap: 13 }]}>
@@ -51,7 +49,7 @@ export function FileThreadCard({ file }: { file: Artifact }) {
             <Text numberOfLines={2} style={s.heading}>
               {file.name}
             </Text>
-            <Text style={s.muted}>PDF</Text>
+            <Text style={s.muted}>{fileKindLabel(file.mimeType)}</Text>
           </View>
           <ChevronRight size={18} color={colors.muted} />
         </View>
@@ -66,15 +64,19 @@ export function TaskThreadCard({ task }: { task: AgentTask }) {
     artifacts: AgentArtifact[];
     files: Artifact[];
     browsers: BrowserSession[];
+    devices?: DeviceSession[];
   }>();
   const [error, setError] = useState("");
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     let active = true;
     void api
-      .request<{ artifacts: AgentArtifact[]; files: Artifact[]; browsers: BrowserSession[] }>(
-        `/api/agent/tasks/${task.id}`,
-      )
+      .request<{
+        artifacts: AgentArtifact[];
+        files: Artifact[];
+        browsers: BrowserSession[];
+        devices?: DeviceSession[];
+      }>(`/api/agent/tasks/${task.id}`)
       .then((result) => {
         if (active) {
           setDetail(result);
@@ -93,6 +95,9 @@ export function TaskThreadCard({ task }: { task: AgentTask }) {
       <TaskCard task={task} compact />
       {detail?.browsers.map((browser) => (
         <BrowserThreadCard key={browser.id} browser={browser} />
+      ))}
+      {(detail?.devices ?? []).map((device) => (
+        <DeviceThreadCard key={device.id} device={device} />
       ))}
       {[...(detail?.files || [])]
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt))

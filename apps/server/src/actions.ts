@@ -2,11 +2,38 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   type ActionProposal,
   type CalendarEvent,
+  type DeviceAction,
   type ProposalInput,
   proposalSchema,
 } from "../../../packages/domain/src/index.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
+
+/** Only Google-backed proposals need a connected Google account to review. */
+function needsAccount(kind: ProposalInput["kind"]) {
+  return kind !== "device.action";
+}
+
+function deviceActionTitle(data: DeviceAction) {
+  const target =
+    data.sessionId ??
+    (data.action.type === "launch" ? (data.action.intentUri ?? data.intentUri) : data.intentUri) ??
+    "phone";
+  switch (data.action.type) {
+    case "launch":
+      return `Open ${data.action.intentUri ?? data.intentUri ?? target} on phone`;
+    case "tap":
+      return `Tap phone at ${data.action.x}, ${data.action.y}`;
+    case "swipe":
+      return `Swipe phone ${data.action.x1},${data.action.y1} to ${data.action.x2},${data.action.y2}`;
+    case "text":
+      return `Type on phone (${data.action.text.slice(0, 40)}${data.action.text.length > 40 ? "…" : ""})`;
+    case "key":
+      return `Press ${data.action.key} on phone`;
+  }
+  void target;
+  return "Phone action";
+}
 
 interface Options {
   execute: (
@@ -14,6 +41,7 @@ interface Options {
     input: ProposalInput,
     connectionId?: string,
     targetVersion?: string,
+    taskId?: string,
   ) => Promise<string>;
   prepare?: (
     owner: string,
@@ -52,16 +80,20 @@ export class ActionService {
     }
     const parsed = proposalSchema.parse(raw);
     const connection = await this.options.connection?.(owner);
-    if (this.options.connection && !connection)
-      throw new AppError("Connect Google before preparing an action", 409);
+    if (needsAccount(parsed.kind)) {
+      if (this.options.connection && !connection)
+        throw new AppError("Connect Google before preparing an action", 409);
+    }
     const prepared = await this.options.prepare?.(owner, parsed, connection?.id);
     const input = proposalSchema.parse(prepared?.input ?? parsed);
     const title =
-      input.kind === "email.send"
-        ? `Send “${input.data.subject}”`
-        : input.kind === "calendar.delete"
-          ? `Delete ${input.data.title}`
-          : `${input.kind === "calendar.create" ? "Create" : "Update"} ${input.data.title}`;
+      input.kind === "device.action"
+        ? deviceActionTitle(input.data)
+        : input.kind === "email.send"
+          ? `Send “${input.data.subject}”`
+          : input.kind === "calendar.delete"
+            ? `Delete ${input.data.title}`
+            : `${input.kind === "calendar.create" ? "Create" : "Update"} ${input.data.title}`;
     const createdAt = new Date(this.now()).toISOString();
     const proposal: ActionProposal = {
       id,
@@ -133,9 +165,11 @@ export class ActionService {
       }
       throw new AppError("This review expired. Create a fresh proposal.", 409);
     }
-    if (decision === "approve" && !(await this.options.connected(owner)))
-      throw new AppError("Google is disconnected. Reconnect before approving this action.", 409);
-    if (decision === "approve" && this.options.connection) {
+    if (decision === "approve" && this.options.connected && needsAccount(proposal.kind)) {
+      if (!(await this.options.connected(owner)))
+        throw new AppError("Google is disconnected. Reconnect before approving this action.", 409);
+    }
+    if (decision === "approve" && this.options.connection && needsAccount(proposal.kind)) {
       const connection = await this.options.connection(owner);
       if (
         !connection ||
@@ -188,6 +222,7 @@ export class ActionService {
         input,
         claimed.connectionId,
         claimed.targetVersion,
+        claimed.taskId ?? undefined,
       );
       finished = { ...claimed, status: "succeeded", result };
     } catch (error) {

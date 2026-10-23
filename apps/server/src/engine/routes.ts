@@ -8,6 +8,7 @@ import type {
 } from "../../../../packages/domain/src/agent.ts";
 import { createTaskSchema } from "../../../../packages/domain/src/agent.ts";
 import { AppError } from "../errors.ts";
+import { pushConfigured, removePushSubscription, savePushSubscription } from "./push.ts";
 import type { AgentService } from "./service.ts";
 
 const text = z.string().trim().min(1).max(4000);
@@ -157,6 +158,32 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
     );
     if (!notification) throw new AppError("Notification not found", 404);
     return c.json(notification);
+  });
+  const pushSchema = z.object({
+    endpoint: z.string().url().max(2000),
+    keys: z.object({
+      p256dh: z.string().min(10).max(300),
+      auth: z.string().min(10).max(100),
+    }),
+  });
+  app.get("/push/public-key", async (c) => {
+    if (!pushConfigured(service.config)) throw new AppError("Push is not configured", 404);
+    return c.json({ publicKey: service.config.vapidPublicKey });
+  });
+  app.post("/push/subscribe", async (c) => {
+    if (!pushConfigured(service.config)) throw new AppError("Push is not configured", 404);
+    const body = pushSchema.parse(await c.req.json());
+    return c.json(
+      await savePushSubscription(service.db, c.get("owner"), body.endpoint, body.keys),
+      201,
+    );
+  });
+  app.post("/push/unsubscribe", async (c) => {
+    const { endpoint } = z
+      .object({ endpoint: z.string().url().max(2000) })
+      .parse(await c.req.json());
+    await removePushSubscription(service.db, c.get("owner"), endpoint);
+    return c.json({ ok: true });
   });
   app.post("/sample-page", async (c) => {
     if (service.config.mode !== "sample") throw new AppError("Not found", 404);

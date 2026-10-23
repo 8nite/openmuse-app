@@ -49,16 +49,23 @@ export interface Config {
   googleRedirectUri: string;
   workerUrl?: string;
   workerToken?: string;
+  standbySessions?: number;
+  deviceEnabled?: boolean;
+  deviceWorkerUrl?: string;
   taskWorkerEnabled?: boolean;
   webSearchEnabled?: boolean;
   computerEnabled?: boolean;
   computerImage?: string;
   computerDeploymentId?: string;
   computerProvider?: ComputerProvider;
+  computerNetwork?: "disabled" | "enabled";
   computerE2bTemplate?: string;
   e2bApiKey?: string;
   allowedOrigins: string[];
   trustProxy?: boolean;
+  vapidPublicKey?: string;
+  vapidPrivateKey?: string;
+  vapidContact?: string;
 }
 
 export type ComputerProvider = "docker" | "e2b-desktop";
@@ -120,6 +127,12 @@ export function readConfig(): Config {
   const computerProvider = process.env.COMPUTER_PROVIDER?.trim() || "docker";
   if (computerProvider !== "docker" && computerProvider !== "e2b-desktop")
     throw new Error("COMPUTER_PROVIDER must be docker or e2b-desktop");
+  // Terminal egress for the Docker computer is off unless explicitly enabled.
+  // "enabled" attaches the container to the bridge network; anything the agent
+  // runs inside can then reach the internet without app review.
+  const computerNetwork = process.env.COMPUTER_NETWORK?.trim() || "disabled";
+  if (computerNetwork !== "disabled" && computerNetwork !== "enabled")
+    throw new Error("COMPUTER_NETWORK must be disabled or enabled");
   const e2bApiKey = process.env.E2B_API_KEY?.trim();
   if (process.env.COMPUTER_ENABLED === "true" && computerProvider === "e2b-desktop") {
     if (!e2bApiKey)
@@ -155,17 +168,29 @@ export function readConfig(): Config {
     googleRedirectUri: `${publicUrl}/api/google/callback`,
     workerUrl: browserWorkerUrl(process.env.BROWSER_WORKER_URL),
     workerToken: process.env.WORKER_TOKEN,
+    // Pre-warmed standby browsers so opening a session skips the Chromium
+    // launch (0 disables, 3 max — each standby holds a live browser).
+    standbySessions: Math.max(
+      0,
+      Math.min(3, Number.parseInt(process.env.BROWSER_STANDBY_SESSIONS ?? "1", 10) || 0),
+    ),
+    deviceEnabled: process.env.DEVICE_ENABLED === "true",
+    deviceWorkerUrl: browserWorkerUrl(process.env.DEVICE_WORKER_URL),
     taskWorkerEnabled: process.env.TASK_WORKER_ENABLED !== "false",
     webSearchEnabled: process.env.WEB_SEARCH_ENABLED !== "false",
     computerEnabled: process.env.COMPUTER_ENABLED === "true",
     computerImage: process.env.COMPUTER_IMAGE ?? "openmuse-computer:local",
     computerDeploymentId: process.env.COMPUTER_DEPLOYMENT_ID,
     computerProvider,
+    computerNetwork,
     computerE2bTemplate: process.env.COMPUTER_E2B_TEMPLATE?.trim() || "desktop",
     e2bApiKey,
     allowedOrigins: (
       process.env.ALLOWED_ORIGINS ?? "http://localhost:8081,http://127.0.0.1:8081"
     ).split(","),
+    vapidPublicKey: process.env.VAPID_PUBLIC_KEY?.trim() || undefined,
+    vapidPrivateKey: process.env.VAPID_PRIVATE_KEY?.trim() || undefined,
+    vapidContact: process.env.VAPID_CONTACT?.trim() || undefined,
     // Only trust X-Forwarded-For/X-Real-IP when the deployment is known to sit
     // behind a proxy that sets them; otherwise a direct caller can spoof them.
     trustProxy: process.env.TRUST_PROXY === "true",
@@ -177,7 +202,13 @@ export function readConfig(): Config {
     throw new Error(
       "Live mode requires OPENMUSE_ACCESS_KEY (24+ characters) and TOKEN_ENCRYPTION_KEY (32-byte base64)",
     );
-  if (mode === "sample" && !["127.0.0.1", "localhost", "::1"].includes(config.host))
-    throw new Error("Sample workspace is local-only. HOST must be a loopback address.");
+  if (
+    mode === "sample" &&
+    !["127.0.0.1", "localhost", "::1"].includes(config.host) &&
+    process.env.SAMPLE_ALLOW_NON_LOOPBACK !== "true"
+  )
+    throw new Error(
+      "Sample workspace is local-only. HOST must be a loopback address (or set SAMPLE_ALLOW_NON_LOOPBACK=true when binding behind a trusted gateway).",
+    );
   return config;
 }

@@ -4,6 +4,7 @@ import type {
   Artifact,
   BrowserSession,
   CalendarEvent,
+  DeviceSession,
   EmailDraft,
   EventDraft,
   Mail,
@@ -17,6 +18,7 @@ export type Detail =
   | { type: "event"; event?: CalendarEvent; draft?: EventDraft; neighbors?: CalendarEvent[] }
   | { type: "file"; file: Artifact }
   | { type: "browser"; browser: BrowserSession }
+  | { type: "device"; device: DeviceSession }
   | { type: "review"; action: ActionProposal }
   | { type: "task"; taskId: string }
   | { type: "delegate"; goalId?: string; milestoneId?: string }
@@ -31,6 +33,7 @@ export interface WorkspaceContextValue {
   refresh: () => Promise<void>;
   open: (detail: Detail) => void;
   close: () => void;
+  logout: () => void;
   notify: (message: string) => void;
   ask: (prompt: string) => void;
 }

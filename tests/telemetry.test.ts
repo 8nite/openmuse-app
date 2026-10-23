@@ -51,7 +51,9 @@ async function captureRuntime(envOverrides: Record<string, string> = {}) {
       {
         cwd: directory,
         env: { ...env, CPK_TELEMETRY_ID: "test-project-identity", ...envOverrides },
-        timeout: 15000,
+        // tsx cold-start plus a full app import can exceed 15s when the
+        // suite runs hot in parallel; the assertions below still fail fast.
+        timeout: 60_000,
       },
     );
     return JSON.parse(stdout.trim().split("\n").at(-1) ?? "[]");

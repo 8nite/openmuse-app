@@ -7,9 +7,13 @@ import {
   useRenderTool,
   useRenderToolCall,
 } from "@copilotkit/react-native/headless";
+import * as DocumentPicker from "expo-document-picker";
+import * as FileSystem from "expo-file-system/legacy";
 import { ArrowDown, ArrowUp, FileText, RotateCcw, Square, X } from "lucide-react-native";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
+  ActivityIndicator,
+  Image,
   Keyboard,
   KeyboardAvoidingView,
   Platform,
@@ -21,12 +25,14 @@ import {
   View,
 } from "react-native";
 import { z } from "zod";
+import type { Artifact, BrowserSession } from "../../../packages/domain/src";
 import { ArtifactCard } from "./agent-ui";
 import { useAgentWorkspace } from "./agent-workspace";
+import { API_URL } from "./api";
 import { AssistantResponse } from "./assistant-response";
 import { BackgroundUpdates } from "./background-updates";
 import { BrowserRunContext, BrowserToolCard } from "./browser-tool-card";
-import { BrowserThreadCard } from "./computer";
+import { BrowserThreadCard, DeviceThreadCard } from "./computer";
 import { ConversationQueue, type QueuedMessage } from "./conversation-queue";
 import {
   ConversationTurnError,
@@ -36,13 +42,17 @@ import {
   threadLocked,
 } from "./conversation-run";
 import { DesktopToolCard } from "./desktop-tool-card";
+import { DeviceToolCard } from "./device-tool-card";
 import { confirmedJevSelection, displayJevUserMessage, latestJevPanelId } from "./jev-actions";
 import { JevInteractionContext, JevToolCard } from "./jev-tool-card";
 import { MailToolCard } from "./mail-tool-card";
 import { SearchToolCard } from "./search-tool-card";
 import { FileThreadCard, TaskThreadCard } from "./thread-artifacts";
 import { type Selection, useMuseThread } from "./threads";
-import { Button, Card, CheckRow, colors, ErrorNotice, s } from "./ui";
+import { Button, Card, colors, ErrorNotice, s } from "./ui";
+import { useChatReplyNotifications } from "./use-web-notifications";
+import { VoiceButton } from "./voice-input";
+import { appendTranscript } from "./voice-support";
 import { useWorkspace } from "./workspace";
 
 const displayParameters = z.record(z.string(), z.unknown());
@@ -88,6 +98,30 @@ export function WorkspaceTools() {
     parameters: displayParameters,
     render: ({ args, result, status }) => (
       <BrowserToolCard url={args.url} result={result} loading={status !== "complete"} />
+    ),
+  });
+  useRenderTool({
+    name: "device_observe",
+    description: "Follow the agent as it observes the paired phone",
+    parameters: displayParameters,
+    render: ({ args, result, status }) => (
+      <DeviceToolCard
+        packageOrUrl={args.packageOrUrl ?? args.intentUri ?? args.url}
+        result={result}
+        loading={status !== "complete"}
+      />
+    ),
+  });
+  useRenderTool({
+    name: "device_action",
+    description: "Follow the agent as it controls the paired phone",
+    parameters: displayParameters,
+    render: ({ args, result, status }) => (
+      <DeviceToolCard
+        packageOrUrl={args.packageOrUrl ?? args.intentUri ?? args.url}
+        result={result}
+        loading={status !== "complete"}
+      />
     ),
   });
   useRenderTool({
@@ -212,7 +246,7 @@ export function ChatScreen({
   thread?: Selection;
   active?: boolean;
 }) {
-  const { api, workspace: w, refresh, navigate } = useWorkspace();
+  const { api, workspace: w, refresh, navigate, open } = useWorkspace();
   const { data: agentWorkspace, refresh: refreshAgent } = useAgentWorkspace();
   const { enabled: richThreads, mainId, claimPrompt } = useMuseThread();
   const selection = thread || { id: "local", existing: false };
@@ -230,7 +264,9 @@ export function ChatScreen({
   const [loaded, setLoaded] = useState(false);
   // Replayed messages show before connectAgent returns; new turns wait until it does.
   const [syncing, setSyncing] = useState(false);
-  const [picking, setPicking] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  const [voiceError, setVoiceError] = useState("");
   const [attachments, setAttachments] = useState<string[]>([]);
   const list = useRef<ScrollView>(null);
   const [queue] = useState(() => new ConversationQueue());
@@ -454,6 +490,66 @@ export function ChatScreen({
       setError(`Could not stop response: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+  // Muse-style takeover: pausing the run hands the shared browser to the user.
+  // The agent takes a fresh look on the next turn, so no stale state is carried over.
+  const takeBrowserControl = useCallback(
+    async (browser: BrowserSession) => {
+      if (busy || agent.isRunning) await stop();
+      open({ type: "browser", browser });
+    },
+    [agent.isRunning, busy, open],
+  );
+  async function uploadFromDevice() {
+    setUploadError("");
+    setUploading(true);
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: [
+          "image/png",
+          "image/jpeg",
+          "image/webp",
+          "image/gif",
+          "application/pdf",
+          "text/plain",
+          "text/markdown",
+          "text/csv",
+        ],
+        copyToCacheDirectory: true,
+      });
+      if (result.canceled) return;
+      const picked = result.assets[0];
+      let artifact: Artifact;
+      if (Platform.OS === "web") {
+        const form = new FormData();
+        if (!picked.file)
+          throw new Error("The selected file could not be read. Please choose it again.");
+        form.append("file", picked.file, picked.name);
+        // Tag chat uploads so the Files library stays uncrowded; the chip in
+        // this composer is the direct attachment, no Files visit needed.
+        form.append("source", "Chat attachment");
+        artifact = await api.request<Artifact>("/api/files", form);
+      } else {
+        const upload = await FileSystem.uploadAsync(`${API_URL}/api/files`, picked.uri, {
+          httpMethod: "POST",
+          uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+          fieldName: "file",
+          mimeType: picked.mimeType || "application/octet-stream",
+          parameters: { source: "Chat attachment" },
+          headers: { Authorization: `Bearer ${api.token}` },
+        });
+        const payload = JSON.parse(upload.body);
+        if (upload.status < 200 || upload.status >= 300)
+          throw new Error(payload.error || "Could not upload this file.");
+        artifact = payload;
+      }
+      await refresh();
+      setAttachments((ids) => (ids.includes(artifact.id) ? ids : [...ids, artifact.id]));
+    } catch (e) {
+      setUploadError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUploading(false);
+    }
+  }
   function send() {
     const text = draft.trim();
     if (!text || !isReady || !loaded) return;
@@ -461,6 +557,8 @@ export function ChatScreen({
     if (!busy && !agent.isRunning && !saveError && !queue.getSnapshot().pending.length)
       queue.resume();
     setShowResults(false);
+    setUploadError("");
+    setVoiceError("");
     const files = w.files.filter((f) => attachments.includes(f.id));
     enqueue(
       text +
@@ -471,9 +569,9 @@ export function ChatScreen({
     setDraft("");
     setInputHeight(44);
     setAttachments([]);
-    setPicking(false);
   }
   const messages = agent.messages || [];
+  useChatReplyNotifications(messages);
   const latestPanelId = latestJevPanelId(messages, threadId);
   const latestUserIndex = messages.reduce(
     (last, message, index) => (message.role === "user" ? index : last),
@@ -490,517 +588,565 @@ export function ChatScreen({
     .at(-1)?.id;
   const replying = busy || agent.isRunning;
   return (
-    <View style={{ flex: 1 }}>
-      <ScrollView
-        ref={list}
-        showsVerticalScrollIndicator={false}
-        contentContainerStyle={{ gap: 13, paddingTop: 15, paddingBottom: 20, flexGrow: 1 }}
-        onScroll={({ nativeEvent: { contentOffset, contentSize, layoutMeasurement } }) => {
-          const nearEnd = contentSize.height - contentOffset.y - layoutMeasurement.height < 100;
-          followLatest.current = nearEnd;
-          setAwayFromLatest(visible.length > 0 && !nearEnd);
-        }}
-        scrollEventThrottle={100}
-        onContentSizeChange={() => {
-          if (active && visible.length > 0 && followLatest.current)
-            list.current?.scrollToEnd({ animated: false });
-        }}
-        keyboardShouldPersistTaps="handled"
-      >
-        {!!historyError && (
-          <>
-            <ErrorNotice error={historyError} />
-            <Button onPress={() => setHistoryAttempt((attempt) => attempt + 1)}>
-              Retry loading conversation
-            </Button>
-          </>
-        )}
-        {!visible.length ? (
-          <View
-            style={{
-              flexGrow: 1,
-              flexShrink: 0,
-              justifyContent: "center",
-              alignItems: "center",
-              paddingVertical: 34,
-              gap: 15,
-            }}
-          >
-            <Text
+    <BrowserRunContext
+      value={{
+        running: replying,
+        active: false,
+        takeControl: (browser) => void takeBrowserControl(browser),
+      }}
+    >
+      <View style={{ flex: 1 }}>
+        <ScrollView
+          ref={list}
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={{ gap: 13, paddingTop: 15, paddingBottom: 20, flexGrow: 1 }}
+          onScroll={({ nativeEvent: { contentOffset, contentSize, layoutMeasurement } }) => {
+            const nearEnd = contentSize.height - contentOffset.y - layoutMeasurement.height < 100;
+            followLatest.current = nearEnd;
+            setAwayFromLatest(visible.length > 0 && !nearEnd);
+          }}
+          scrollEventThrottle={100}
+          onContentSizeChange={() => {
+            if (active && visible.length > 0 && followLatest.current)
+              list.current?.scrollToEnd({ animated: false });
+          }}
+          keyboardShouldPersistTaps="handled"
+        >
+          {!!historyError && (
+            <>
+              <ErrorNotice error={historyError} />
+              <Button onPress={() => setHistoryAttempt((attempt) => attempt + 1)}>
+                Retry loading conversation
+              </Button>
+            </>
+          )}
+          {!visible.length ? (
+            <View
               style={{
-                fontSize: 28,
-                letterSpacing: -1,
-                color: colors.text,
-                textAlign: "center",
-                maxWidth: 350,
+                flexGrow: 1,
+                flexShrink: 0,
+                justifyContent: "center",
+                alignItems: "center",
+                paddingVertical: 34,
+                gap: 15,
               }}
             >
-              A little help. A lot more room for life.
-            </Text>
-            <Text style={[s.muted, { maxWidth: 320, textAlign: "center", lineHeight: 23 }]}>
-              Tell me what’s on your mind. I can make a plan, work with your apps, and use my
-              computer to help.
-            </Text>
-            <View style={{ width: "100%", maxWidth: 360, marginTop: 14, gap: 8 }}>
-              {[
-                {
-                  text: "Find cool things on Hacker News",
-                  action: () => enqueue("Check out Hacker News for cool stuff"),
-                },
-                {
-                  text: "Summarize copilotkit.ai",
-                  action: () => enqueue("Summarize copilotkit.ai"),
-                },
-                { text: "Keep an eye on a website", action: () => navigate("goals") },
-              ].map((item) => (
-                <Button key={item.text} onPress={item.action}>
-                  {item.text}
+              <Text
+                style={{
+                  fontSize: 28,
+                  letterSpacing: -1,
+                  color: colors.text,
+                  textAlign: "center",
+                  maxWidth: 350,
+                }}
+              >
+                A little help. A lot more room for life.
+              </Text>
+              <Text style={[s.muted, { maxWidth: 320, textAlign: "center", lineHeight: 23 }]}>
+                Tell me what’s on your mind. I can make a plan, work with your apps, and use my
+                computer to help.
+              </Text>
+              <View style={{ width: "100%", maxWidth: 360, marginTop: 14, gap: 8 }}>
+                {[
+                  {
+                    text: "Find cool things on Hacker News",
+                    action: () => enqueue("Check out Hacker News for cool stuff"),
+                  },
+                  {
+                    text: "Summarize copilotkit.ai",
+                    action: () => enqueue("Summarize copilotkit.ai"),
+                  },
+                  { text: "Keep an eye on a website", action: () => navigate("goals") },
+                ].map((item) => (
+                  <Button key={item.text} onPress={item.action}>
+                    {item.text}
+                  </Button>
+                ))}
+              </View>
+            </View>
+          ) : (
+            visible.map((message) => {
+              const user = message.role === "user";
+              const text =
+                typeof message.content === "string"
+                  ? user
+                    ? displayJevUserMessage(
+                        message.content,
+                        messages.slice(0, messages.indexOf(message)),
+                      )
+                    : message.content
+                  : "";
+              const toolCalls = "toolCalls" in message ? message.toolCalls || [] : [];
+              // Uploaded images stay visible in the transcript via their artifact IDs.
+              const attachedImages = user
+                ? [
+                    ...new Set(
+                      text.match(
+                        /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
+                      ) || [],
+                    ),
+                  ]
+                    .map((id) => w.files.find((f) => f.id.toLowerCase() === id.toLowerCase()))
+                    .filter((f): f is Artifact => !!f && f.mimeType.startsWith("image/"))
+                : [];
+              return (
+                <View
+                  key={message.id}
+                  style={{
+                    alignSelf: user ? "flex-end" : "flex-start",
+                    maxWidth: user ? "85%" : "95%",
+                    width: toolCalls.length ? "95%" : undefined,
+                    gap: 8,
+                  }}
+                >
+                  {!!text && (
+                    <View
+                      style={{
+                        paddingHorizontal: 16,
+                        paddingVertical: 13,
+                        borderRadius: 22,
+                        borderBottomRightRadius: user ? 7 : 22,
+                        borderBottomLeftRadius: user ? 22 : 7,
+                        backgroundColor: user ? colors.blue : "#EEEEF0",
+                      }}
+                    >
+                      {user ? (
+                        <Text selectable style={[s.text, { fontSize: 16, lineHeight: 24 }]}>
+                          {text}
+                        </Text>
+                      ) : (
+                        <AssistantResponse content={text} />
+                      )}
+                      {attachedImages.length > 0 && (
+                        <View
+                          style={{ flexDirection: "row", gap: 6, flexWrap: "wrap", marginTop: 10 }}
+                        >
+                          {attachedImages.map((f) => (
+                            <Pressable
+                              key={f.id}
+                              accessibilityRole="button"
+                              accessibilityLabel={`Open attached image: ${f.name}`}
+                              onPress={() => open({ type: "file", file: f })}
+                            >
+                              <Image
+                                source={{ uri: api.url(f.url) }}
+                                resizeMode="cover"
+                                style={{ width: 140, height: 140, borderRadius: 12 }}
+                              />
+                            </Pressable>
+                          ))}
+                        </View>
+                      )}
+                    </View>
+                  )}
+                  <JevInteractionContext.Provider
+                    value={{
+                      threadId,
+                      busy:
+                        busy ||
+                        agent.isRunning ||
+                        !loaded ||
+                        !isReady ||
+                        !!outbox.pending.length ||
+                        outbox.paused ||
+                        !!saveError,
+                      latestPanelId,
+                      latestUserText,
+                      send: sendChoice,
+                      retry: (text) => sendChoice(text, true),
+                      canRetry:
+                        loaded &&
+                        isReady &&
+                        !busy &&
+                        !agent.isRunning &&
+                        !outbox.running &&
+                        !outbox.pending.length &&
+                        !saveError,
+                      confirmedSelection: (panelId) => confirmedJevSelection(messages, panelId),
+                    }}
+                  >
+                    <BrowserRunContext
+                      value={{
+                        running: busy || agent.isRunning,
+                        active:
+                          (busy || agent.isRunning) && messages.indexOf(message) > latestUserIndex,
+                        takeControl: (browser) => void takeBrowserControl(browser),
+                      }}
+                    >
+                      {toolCalls.map((toolCall) => {
+                        const toolMessage = messages.find(
+                          (candidate): candidate is ToolMessage =>
+                            candidate.role === "tool" && candidate.toolCallId === toolCall.id,
+                        );
+                        return (
+                          <View key={toolCall.id}>{renderToolCall({ toolCall, toolMessage })}</View>
+                        );
+                      })}
+                    </BrowserRunContext>
+                  </JevInteractionContext.Provider>
+                </View>
+              );
+            })
+          )}
+          {!!latestDesktop && (
+            <DesktopToolCard
+              live
+              toolCallId={latestDesktop}
+              result={
+                messages.find(
+                  (message) => message.role === "tool" && message.toolCallId === latestDesktop,
+                )?.content
+              }
+              loading={replying}
+            />
+          )}
+          {!richThreads && (
+            <>
+              {(w.files.some((file) => file.parentId) ||
+                w.browsers.some((browser) => browser.status === "active") ||
+                (w.devices ?? []).some((device) => device.status === "active") ||
+                !!agentWorkspace?.artifacts.length) && (
+                <Button
+                  small
+                  style={{ alignSelf: "flex-start", marginTop: 6 }}
+                  onPress={() => setShowResults(!showResults)}
+                >
+                  {showResults ? "Hide recent results" : "Recent results"}
                 </Button>
+              )}
+              {showResults && (
+                <>
+                  {w.files
+                    .filter((file) => file.parentId)
+                    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+                    .slice(0, 1)
+                    .map((file) => (
+                      <FileThreadCard key={file.id} file={file} />
+                    ))}
+                  {w.browsers
+                    .filter((browser) => browser.status === "active")
+                    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+                    .slice(0, 1)
+                    .map((browser) => (
+                      <BrowserThreadCard key={browser.id} browser={browser} />
+                    ))}
+                  {(w.devices ?? [])
+                    .filter((device) => device.status === "active")
+                    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+                    .slice(0, 1)
+                    .map((device) => (
+                      <DeviceThreadCard key={device.id} device={device} />
+                    ))}
+                  {[...(agentWorkspace?.artifacts || [])]
+                    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+                    .filter(
+                      (artifact, index, items) =>
+                        items.findIndex((item) => item.kind === artifact.kind) === index,
+                    )
+                    .slice(0, 2)
+                    .reverse()
+                    .map((artifact) => (
+                      <ArtifactCard key={artifact.id} artifact={artifact} />
+                    ))}
+                </>
+              )}
+            </>
+          )}
+          {(!richThreads || selection.id === mainId) && <BackgroundUpdates />}
+          {(busy || agent.isRunning) && (
+            <View
+              accessibilityLabel="Agent is working"
+              style={[
+                s.row,
+                {
+                  alignSelf: "flex-start",
+                  gap: 7,
+                  paddingHorizontal: 19,
+                  paddingVertical: 18,
+                  backgroundColor: "#EEEEF0",
+                  borderRadius: 28,
+                },
+              ]}
+            >
+              {[0.4, 0.75, 0.5].map((opacity) => (
+                <View
+                  key={opacity}
+                  style={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: 4,
+                    backgroundColor: colors.muted,
+                    opacity,
+                  }}
+                />
               ))}
             </View>
-          </View>
-        ) : (
-          visible.map((message) => {
-            const user = message.role === "user";
-            const text =
-              typeof message.content === "string"
-                ? user
-                  ? displayJevUserMessage(
-                      message.content,
-                      messages.slice(0, messages.indexOf(message)),
-                    )
-                  : message.content
-                : "";
-            const toolCalls = "toolCalls" in message ? message.toolCalls || [] : [];
-            return (
-              <View
-                key={message.id}
-                style={{
-                  alignSelf: user ? "flex-end" : "flex-start",
-                  maxWidth: user ? "85%" : "95%",
-                  width: toolCalls.length ? "95%" : undefined,
-                  gap: 8,
-                }}
-              >
-                {!!text && (
-                  <View
-                    style={{
-                      paddingHorizontal: 16,
-                      paddingVertical: 13,
-                      borderRadius: 22,
-                      borderBottomRightRadius: user ? 7 : 22,
-                      borderBottomLeftRadius: user ? 22 : 7,
-                      backgroundColor: user ? colors.blue : "#EEEEF0",
-                    }}
-                  >
-                    {user ? (
-                      <Text selectable style={[s.text, { fontSize: 16, lineHeight: 24 }]}>
-                        {text}
-                      </Text>
-                    ) : (
-                      <AssistantResponse content={text} />
-                    )}
-                  </View>
-                )}
-                <JevInteractionContext.Provider
-                  value={{
-                    threadId,
-                    busy:
-                      busy ||
-                      agent.isRunning ||
-                      !loaded ||
-                      !isReady ||
-                      !!outbox.pending.length ||
-                      outbox.paused ||
-                      !!saveError,
-                    latestPanelId,
-                    latestUserText,
-                    send: sendChoice,
-                    retry: (text) => sendChoice(text, true),
-                    canRetry:
-                      loaded &&
-                      isReady &&
-                      !busy &&
-                      !agent.isRunning &&
-                      !outbox.running &&
-                      !outbox.pending.length &&
-                      !saveError,
-                    confirmedSelection: (panelId) => confirmedJevSelection(messages, panelId),
-                  }}
-                >
-                  <BrowserRunContext
-                    value={{
-                      running: busy || agent.isRunning,
-                      active:
-                        (busy || agent.isRunning) && messages.indexOf(message) > latestUserIndex,
-                    }}
-                  >
-                    {toolCalls.map((toolCall) => {
-                      const toolMessage = messages.find(
-                        (candidate): candidate is ToolMessage =>
-                          candidate.role === "tool" && candidate.toolCallId === toolCall.id,
-                      );
-                      return (
-                        <View key={toolCall.id}>{renderToolCall({ toolCall, toolMessage })}</View>
-                      );
-                    })}
-                  </BrowserRunContext>
-                </JevInteractionContext.Provider>
-              </View>
-            );
-          })
-        )}
-        {!!latestDesktop && (
-          <DesktopToolCard
-            live
-            toolCallId={latestDesktop}
-            result={
-              messages.find(
-                (message) => message.role === "tool" && message.toolCallId === latestDesktop,
-              )?.content
-            }
-            loading={replying}
-          />
-        )}
-        {!richThreads && (
-          <>
-            {(w.files.some((file) => file.parentId) ||
-              w.browsers.some((browser) => browser.status === "active") ||
-              !!agentWorkspace?.artifacts.length) && (
-              <Button
-                small
-                style={{ alignSelf: "flex-start", marginTop: 6 }}
-                onPress={() => setShowResults(!showResults)}
-              >
-                {showResults ? "Hide recent results" : "Recent results"}
-              </Button>
-            )}
-            {showResults && (
-              <>
-                {w.files
-                  .filter((file) => file.parentId)
-                  .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-                  .slice(0, 1)
-                  .map((file) => (
-                    <FileThreadCard key={file.id} file={file} />
-                  ))}
-                {w.browsers
-                  .filter((browser) => browser.status === "active")
-                  .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-                  .slice(0, 1)
-                  .map((browser) => (
-                    <BrowserThreadCard key={browser.id} browser={browser} />
-                  ))}
-                {[...(agentWorkspace?.artifacts || [])]
-                  .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-                  .filter(
-                    (artifact, index, items) =>
-                      items.findIndex((item) => item.kind === artifact.kind) === index,
-                  )
-                  .slice(0, 2)
-                  .reverse()
-                  .map((artifact) => (
-                    <ArtifactCard key={artifact.id} artifact={artifact} />
-                  ))}
-              </>
-            )}
-          </>
-        )}
-        {(!richThreads || selection.id === mainId) && <BackgroundUpdates />}
-        {(busy || agent.isRunning) && (
-          <View
-            accessibilityLabel="Agent is working"
-            style={[
-              s.row,
-              {
-                alignSelf: "flex-start",
-                gap: 7,
-                paddingHorizontal: 19,
-                paddingVertical: 18,
-                backgroundColor: "#EEEEF0",
-                borderRadius: 28,
-              },
-            ]}
-          >
-            {[0.4, 0.75, 0.5].map((opacity) => (
-              <View
-                key={opacity}
-                style={{
-                  width: 8,
-                  height: 8,
-                  borderRadius: 4,
-                  backgroundColor: colors.muted,
-                  opacity,
-                }}
-              />
-            ))}
-          </View>
-        )}
-        <ErrorNotice error={error} />
-        {!!error && (
-          <Button
-            style={{ alignSelf: "flex-start" }}
-            icon={RotateCcw}
-            disabled={busy || agent.isRunning || !loaded || syncing || !isReady}
-            onPress={() => {
-              void run()
-                .then(() => {
-                  if (!queue.getSnapshot().paused) flush();
-                })
-                .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-            }}
-          >
-            Retry response
-          </Button>
-        )}
-      </ScrollView>
-      {awayFromLatest && (
-        <Button
-          small
-          icon={ArrowDown}
-          style={{ alignSelf: "center", marginBottom: 10 }}
-          onPress={() => {
-            followLatest.current = true;
-            setAwayFromLatest(false);
-            list.current?.scrollToEnd({ animated: true });
-          }}
-        >
-          Latest messages
-        </Button>
-      )}
-      <KeyboardAvoidingView
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
-        style={keyboardPadding > 0 ? { paddingBottom: keyboardPadding } : undefined}
-      >
-        <ErrorNotice error={saveError} />
-        {!!saveError && (
+          )}
+          <ErrorNotice error={error} />
+          {!!error && (
+            <Button
+              style={{ alignSelf: "flex-start" }}
+              icon={RotateCcw}
+              disabled={busy || agent.isRunning || !loaded || syncing || !isReady}
+              onPress={() => {
+                void run()
+                  .then(() => {
+                    if (!queue.getSnapshot().paused) flush();
+                  })
+                  .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+              }}
+            >
+              Retry response
+            </Button>
+          )}
+        </ScrollView>
+        {awayFromLatest && (
           <Button
             small
-            disabled={busy}
+            icon={ArrowDown}
+            style={{ alignSelf: "center", marginBottom: 10 }}
             onPress={() => {
-              void saveHistory().catch((e) => setSaveError(String(e)));
+              followLatest.current = true;
+              setAwayFromLatest(false);
+              list.current?.scrollToEnd({ animated: true });
             }}
           >
-            Retry saving conversation
+            Latest messages
           </Button>
         )}
-        {!!outbox.pending.length && (
-          <View style={{ padding: 12, gap: 6 }}>
-            <Text style={s.small}>
-              {outbox.paused ? "Messages on hold" : "Up next"} · Keep the app open until sent
-            </Text>
-            {outbox.pending.map((message) => (
-              <View key={message.id} style={[s.row, { gap: 8 }]}>
-                <Text numberOfLines={2} style={[s.muted, { flex: 1 }]}>
-                  {displayJevUserMessage(message.text, messages)}
-                </Text>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel={`Remove queued message: ${displayJevUserMessage(message.text, messages)}`}
-                  hitSlop={10}
-                  onPress={() => {
-                    queue.remove(message.id);
-                    choiceCompletions.current
-                      .get(message.id)
-                      ?.reject(new Error("Choice removed from queue."));
-                    choiceCompletions.current.delete(message.id);
-                  }}
-                  style={{ padding: 8 }}
-                >
-                  <X size={16} color={colors.muted} />
-                </Pressable>
-              </View>
-            ))}
-            {outbox.paused && (
-              <Button
-                small
-                disabled={busy || !!saveError}
-                onPress={() => {
-                  queue.resume();
-                  flush();
-                }}
-              >
-                Send queued messages
-              </Button>
-            )}
-          </View>
-        )}
-        {picking && (
-          <Card style={{ marginBottom: 12, padding: 15 }}>
-            <Text style={s.heading}>Add a document</Text>
-            <ScrollView style={{ maxHeight: 230 }} keyboardShouldPersistTaps="handled">
-              {w.files.length ? (
-                w.files.map((f) => (
-                  <CheckRow
-                    key={f.id}
-                    checked={attachments.includes(f.id)}
-                    label={f.name}
-                    onPress={() =>
-                      setAttachments(
-                        attachments.includes(f.id)
-                          ? attachments.filter((id) => id !== f.id)
-                          : [...attachments, f.id],
-                      )
-                    }
-                  />
-                ))
-              ) : (
-                <Text style={s.muted}>Import a PDF in Files to use it in a conversation.</Text>
-              )}
-            </ScrollView>
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          style={keyboardPadding > 0 ? { paddingBottom: keyboardPadding } : undefined}
+        >
+          <ErrorNotice error={saveError} />
+          {!!saveError && (
             <Button
               small
-              onPress={() => setPicking(false)}
-              style={{ alignSelf: "flex-end", marginTop: 8 }}
+              disabled={busy}
+              onPress={() => {
+                void saveHistory().catch((e) => setSaveError(String(e)));
+              }}
             >
-              Done
+              Retry saving conversation
             </Button>
-          </Card>
-        )}
-        <View
-          style={{
-            backgroundColor: "#FFF",
-            borderRadius: 32,
-            borderWidth: 1,
-            borderColor: focused ? "#C7E4F9" : "#EEF0F2",
-            padding: 8,
-            shadowColor: "#18384B",
-            shadowOpacity: focused ? 0.1 : 0.06,
-            shadowRadius: 20,
-            shadowOffset: { width: 0, height: 4 },
-            elevation: 4,
-          }}
-        >
-          {attachments.length > 0 && (
-            <View style={[s.row, { gap: 6, flexWrap: "wrap", padding: 9 }]}>
-              {w.files
-                .filter((f) => attachments.includes(f.id))
-                .map((f) => (
+          )}
+          {!!outbox.pending.length && (
+            <View style={{ padding: 12, gap: 6 }}>
+              <Text style={s.small}>
+                {outbox.paused ? "Messages on hold" : "Up next"} · Keep the app open until sent
+              </Text>
+              {outbox.pending.map((message) => (
+                <View key={message.id} style={[s.row, { gap: 8 }]}>
+                  <Text numberOfLines={2} style={[s.muted, { flex: 1 }]}>
+                    {displayJevUserMessage(message.text, messages)}
+                  </Text>
                   <Pressable
-                    key={f.id}
                     accessibilityRole="button"
-                    accessibilityLabel={`Remove attachment: ${f.name}`}
-                    onPress={() => setAttachments((ids) => ids.filter((id) => id !== f.id))}
-                    style={[
-                      s.row,
-                      {
-                        gap: 7,
-                        maxWidth: "100%",
-                        backgroundColor: colors.sky,
-                        borderRadius: 16,
-                        paddingHorizontal: 11,
-                        paddingVertical: 8,
-                      },
-                    ]}
+                    accessibilityLabel={`Remove queued message: ${displayJevUserMessage(message.text, messages)}`}
+                    hitSlop={10}
+                    onPress={() => {
+                      queue.remove(message.id);
+                      choiceCompletions.current
+                        .get(message.id)
+                        ?.reject(new Error("Choice removed from queue."));
+                      choiceCompletions.current.delete(message.id);
+                    }}
+                    style={{ padding: 8 }}
                   >
-                    <FileText size={14} color={colors.blueDark} />
-                    <Text
-                      numberOfLines={1}
-                      style={{ flexShrink: 1, fontSize: 12, color: colors.text }}
-                    >
-                      {f.name}
-                    </Text>
-                    <X size={13} color={colors.muted} />
+                    <X size={16} color={colors.muted} />
                   </Pressable>
-                ))}
+                </View>
+              ))}
+              {outbox.paused && (
+                <Button
+                  small
+                  disabled={busy || !!saveError}
+                  onPress={() => {
+                    queue.resume();
+                    flush();
+                  }}
+                >
+                  Send queued messages
+                </Button>
+              )}
             </View>
           )}
-          <View style={[s.row, { gap: 7, alignItems: "flex-end" }]}>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Attach a document"
-              accessibilityState={{ expanded: picking }}
-              onPress={() => setPicking(!picking)}
-              style={({ pressed }) => ({
-                width: 44,
-                height: 44,
-                alignItems: "center",
-                justifyContent: "center",
-                borderRadius: 24,
-                backgroundColor: picking || pressed ? colors.sky : "transparent",
-              })}
-            >
-              <Text style={{ color: colors.text, fontSize: 29, fontWeight: "300", lineHeight: 32 }}>
-                +
-              </Text>
-            </Pressable>
-            <TextInput
-              accessibilityLabel="Message OpenMuse"
-              value={draft}
-              onChangeText={setDraft}
-              onContentSizeChange={(event) =>
-                setInputHeight(Math.max(44, Math.min(140, event.nativeEvent.contentSize.height)))
-              }
-              placeholder={
-                !isReady
-                  ? "Connecting…"
-                  : !loaded
-                    ? historyError
-                      ? "Conversation unavailable"
-                      : "Loading conversation…"
-                    : "Message…"
-              }
-              placeholderTextColor="#949B9F"
-              selectionColor={colors.blueDark}
-              onFocus={() => setFocused(true)}
-              onBlur={() => setFocused(false)}
-              style={{
-                flex: 1,
-                color: colors.text,
-                height: inputHeight,
-                minHeight: 44,
-                maxHeight: 140,
-                fontSize: 17,
-                lineHeight: 24,
-                paddingHorizontal: 2,
-                paddingTop: 10,
-                paddingBottom: 10,
-                ...noFocusRing,
-              }}
-              multiline
-              editable
-              onKeyPress={
-                Platform.OS === "web"
-                  ? (event) => {
-                      if (
-                        event.nativeEvent.key === "Enter" &&
-                        !("shiftKey" in event.nativeEvent && event.nativeEvent.shiftKey)
-                      ) {
-                        event.preventDefault();
-                        send();
+          {!!uploadError && (
+            <View style={{ paddingHorizontal: 12, paddingBottom: 8 }}>
+              <ErrorNotice error={uploadError} />
+            </View>
+          )}
+          {!!voiceError && (
+            <View style={{ paddingHorizontal: 12, paddingBottom: 8 }}>
+              <ErrorNotice error={voiceError} />
+            </View>
+          )}
+          <View
+            style={{
+              backgroundColor: "#FFF",
+              borderRadius: 32,
+              borderWidth: 1,
+              borderColor: focused ? "#C7E4F9" : "#EEF0F2",
+              padding: 8,
+              shadowColor: "#18384B",
+              shadowOpacity: focused ? 0.1 : 0.06,
+              shadowRadius: 20,
+              shadowOffset: { width: 0, height: 4 },
+              elevation: 4,
+            }}
+          >
+            {attachments.length > 0 && (
+              <View style={[s.row, { gap: 6, flexWrap: "wrap", padding: 9 }]}>
+                {w.files
+                  .filter((f) => attachments.includes(f.id))
+                  .map((f) => (
+                    <Pressable
+                      key={f.id}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Remove attachment: ${f.name}`}
+                      onPress={() => setAttachments((ids) => ids.filter((id) => id !== f.id))}
+                      style={[
+                        s.row,
+                        {
+                          gap: 7,
+                          maxWidth: "100%",
+                          backgroundColor: colors.sky,
+                          borderRadius: 16,
+                          paddingHorizontal: 11,
+                          paddingVertical: 8,
+                        },
+                      ]}
+                    >
+                      {f.mimeType.startsWith("image/") ? (
+                        <Image
+                          source={{ uri: api.url(f.url) }}
+                          style={{ width: 26, height: 26, borderRadius: 8 }}
+                        />
+                      ) : (
+                        <FileText size={14} color={colors.blueDark} />
+                      )}
+                      <Text
+                        numberOfLines={1}
+                        style={{ flexShrink: 1, fontSize: 12, color: colors.text }}
+                      >
+                        {f.name}
+                      </Text>
+                      <X size={13} color={colors.muted} />
+                    </Pressable>
+                  ))}
+              </View>
+            )}
+            <View style={[s.row, { gap: 7, alignItems: "flex-end" }]}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Attach a file or image"
+                accessibilityState={{ busy: uploading }}
+                disabled={uploading}
+                onPress={() => void uploadFromDevice()}
+                style={({ pressed }) => ({
+                  width: 44,
+                  height: 44,
+                  alignItems: "center",
+                  justifyContent: "center",
+                  borderRadius: 24,
+                  backgroundColor: pressed ? colors.sky : "transparent",
+                })}
+              >
+                {uploading ? (
+                  <ActivityIndicator color={colors.blueDark} />
+                ) : (
+                  <Text
+                    style={{ color: colors.text, fontSize: 29, fontWeight: "300", lineHeight: 32 }}
+                  >
+                    +
+                  </Text>
+                )}
+              </Pressable>
+              <TextInput
+                accessibilityLabel="Message OpenMuse"
+                value={draft}
+                onChangeText={setDraft}
+                onContentSizeChange={(event) =>
+                  setInputHeight(Math.max(44, Math.min(140, event.nativeEvent.contentSize.height)))
+                }
+                placeholder={
+                  !isReady
+                    ? "Connecting…"
+                    : !loaded
+                      ? historyError
+                        ? "Conversation unavailable"
+                        : "Loading conversation…"
+                      : "Message…"
+                }
+                placeholderTextColor="#949B9F"
+                selectionColor={colors.blueDark}
+                onFocus={() => setFocused(true)}
+                onBlur={() => setFocused(false)}
+                style={{
+                  flex: 1,
+                  color: colors.text,
+                  height: inputHeight,
+                  minHeight: 44,
+                  maxHeight: 140,
+                  fontSize: 17,
+                  lineHeight: 24,
+                  paddingHorizontal: 2,
+                  paddingTop: 10,
+                  paddingBottom: 10,
+                  ...noFocusRing,
+                }}
+                multiline
+                editable
+                onKeyPress={
+                  Platform.OS === "web"
+                    ? (event) => {
+                        if (
+                          event.nativeEvent.key === "Enter" &&
+                          !("shiftKey" in event.nativeEvent && event.nativeEvent.shiftKey)
+                        ) {
+                          event.preventDefault();
+                          send();
+                        }
                       }
-                    }
-                  : undefined
-              }
-            />
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={replying ? "Stop reply" : "Send message"}
-              disabled={!replying && (!draft.trim() || !loaded || !isReady)}
-              onPress={replying ? () => void stop() : send}
-              style={({ pressed }) => ({
-                width: 44,
-                height: 44,
-                borderRadius: 24,
-                backgroundColor: replying || draft.trim() ? colors.blue : "#F3F5F6",
-                alignItems: "center",
-                justifyContent: "center",
-                transform: [{ scale: pressed ? 0.94 : 1 }],
-              })}
-            >
-              {replying ? (
-                <Square size={18} fill={colors.text} strokeWidth={0} />
-              ) : (
-                <ArrowUp
-                  size={25}
-                  strokeWidth={1.8}
-                  color={draft.trim() ? colors.text : "#9CB5C5"}
-                />
-              )}
-            </Pressable>
+                    : undefined
+                }
+              />
+              <VoiceButton
+                onTranscript={(text) => {
+                  setVoiceError("");
+                  setDraft((current) => appendTranscript(current, text));
+                }}
+                onError={setVoiceError}
+              />
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={replying ? "Stop reply" : "Send message"}
+                disabled={!replying && (!draft.trim() || !loaded || !isReady)}
+                onPress={replying ? () => void stop() : send}
+                style={({ pressed }) => ({
+                  width: 44,
+                  height: 44,
+                  borderRadius: 24,
+                  backgroundColor: replying || draft.trim() ? colors.blue : "#F3F5F6",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  transform: [{ scale: pressed ? 0.94 : 1 }],
+                })}
+              >
+                {replying ? (
+                  <Square size={18} fill={colors.text} strokeWidth={0} />
+                ) : (
+                  <ArrowUp
+                    size={25}
+                    strokeWidth={1.8}
+                    color={draft.trim() ? colors.text : "#9CB5C5"}
+                  />
+                )}
+              </Pressable>
+            </View>
           </View>
-        </View>
-      </KeyboardAvoidingView>
-    </View>
+        </KeyboardAvoidingView>
+      </View>
+    </BrowserRunContext>
   );
 }

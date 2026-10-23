@@ -13,7 +13,7 @@ export const fixturePdf = await readFile(new URL("./fixtures/document.pdf", impo
 export async function createBrowserFixture(options: { host?: string; port?: number } = {}) {
   const paths: string[] = [];
   const unexpected: string[] = [];
-  const server = createServer((incoming, response) => {
+  const server = createServer(async (incoming, response) => {
     const path = incoming.url ?? "";
     if (path === "/__requests" && incoming.method === "GET") {
       response.writeHead(200, { "content-type": "application/json" });
@@ -21,6 +21,16 @@ export async function createBrowserFixture(options: { host?: string; port?: numb
       return;
     }
     paths.push(path);
+    if (path === "/slow") {
+      // Slower than the worker's old 30s socket kill: navigating here proves
+      // slow-but-real loads survive the full API round trip.
+      await new Promise((resolve) => setTimeout(resolve, 35_000));
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end(
+        `<html><head><title>${fixtureTitle}</title></head><body>Slow but real page.</body></html>`,
+      );
+      return;
+    }
     if (path === "/redirect-private") {
       response.writeHead(302, { location: "http://127.0.0.1/blocked" });
       response.end();
@@ -44,6 +54,11 @@ export async function createBrowserFixture(options: { host?: string; port?: numb
       body = `<script>localStorage.setItem("openmuse-profile-test", "retained");</script>`;
     else if (path === "/state")
       body = `<script>document.body.textContent = localStorage.getItem("openmuse-profile-test") ?? "missing";</script>`;
+    else if (path === "/flip")
+      // Loads clean, then an anti-bot-style sensor flips the DOM seconds
+      // later — the Walmart shape: open succeeds, later reads refuse, but
+      // the session stays live for Take control.
+      body = `Stable page text.<script>setTimeout(() => { document.title = "Verify Your Identity"; document.body.innerHTML = "Activate and hold the button to confirm that you're human. Press and hold."; }, 15000);</script>`;
     else if (path === "/favicon.ico") {
       response.writeHead(204);
       response.end();

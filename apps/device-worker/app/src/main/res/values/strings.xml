@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_description">Lets the OpenMuse phone worker see the screen, tap and swipe, and read app labels for remote control you approve.</string>
+</resources>

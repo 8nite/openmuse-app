@@ -18,7 +18,7 @@ The native and web agent core runs locally. This inventory describes the current
 | Connectors | Searchable capability/status catalogue, Google connection, browser worker | Plaid, health, Instagram, WhatsApp and partner APIs |
 | OpenBot | Disabled adapter with pinned protocol/identity tests | Live session bridge, routines and computer backend wiring |
 
-The Linux computer is disabled until configured on the server and has no network access. It is a single-owner container with a persistent `/workspace`, separate from the browser worker; see [computer setup and limits](COMPUTER.md). It is not a graphical desktop or a full OS VM.
+The Linux computer is disabled until configured on the server and has no network access unless `COMPUTER_NETWORK=enabled`. It is a single-owner container with a persistent `/workspace`, separate from the browser worker; see [computer setup and limits](COMPUTER.md). It is not a graphical desktop or a full OS VM.
 
 Model chat can read the connected primary calendar for an explicit time range of up to 366 days. Missing dates or time zones need clarification. A reply uses at most 20 events and bounded event text; partial results and connection failures are reported. All-day dates keep their calendar time zone and exclusive end date. Calendar changes still require action review. The sample agent's canned replies do not provide this model tool.
 

@@ -6,7 +6,11 @@ import type { BrowserSession } from "../../../packages/domain/src";
 import { Button, Card, colors, ErrorNotice, s } from "./ui";
 import { useWorkspace } from "./workspace";
 
-export const BrowserRunContext = createContext({ running: false, active: false });
+export const BrowserRunContext = createContext<{
+  running: boolean;
+  active: boolean;
+  takeControl?: (browser: BrowserSession) => void;
+}>({ running: false, active: false });
 
 const observationSchema = z.object({
   sessionId: z.string(),
@@ -43,12 +47,18 @@ export function BrowserToolCard({
   loading: boolean;
 }) {
   const { api, workspace, open } = useWorkspace();
-  const { running, active } = useContext(BrowserRunContext);
+  const { running, active, takeControl } = useContext(BrowserRunContext);
   const working = loading && active;
   const value = resultValue(result);
   const observation = observationSchema.safeParse(value);
-  const toolError = z.object({ error: z.string() }).safeParse(value);
-  const sessionId = observation.success ? observation.data.sessionId : undefined;
+  const toolError = z
+    .object({ error: z.string(), sessionId: z.string().optional() })
+    .safeParse(value);
+  const sessionId = observation.success
+    ? observation.data.sessionId
+    : toolError.success
+      ? toolError.data.sessionId
+      : undefined;
   const current = workspace.browsers.find((browser) => browser.id === sessionId);
   const [browser, setBrowser] = useState<BrowserSession>();
   const [error, setError] = useState("");
@@ -91,6 +101,9 @@ export function BrowserToolCard({
     : !loading && !visited
       ? "The browser did not return a page. Try your request again."
       : "";
+  // A refused read (e.g. anti-bot challenge) still leaves a live session on
+  // the block page — offer Take control of it instead of a dead end.
+  const failedSession = !visited && toolError.success ? toolError.data.sessionId : undefined;
   return (
     <Card
       style={{ padding: 13, backgroundColor: "#EEEEF0", gap: 12, width: "100%", maxWidth: 440 }}
@@ -141,28 +154,32 @@ export function BrowserToolCard({
             </View>
           ) : visited ? (
             <Text style={s.small}>
-              {browser && browser.url !== visited.url
-                ? "Page visited. The browser has moved on."
-                : browser?.status === "closed"
-                  ? "Session saved. Take control to reopen it."
-                  : browser?.status === "error"
-                    ? "Session needs attention. Take control to reconnect."
-                    : previewFailed
-                      ? "Preview unavailable. You can still take control."
-                      : "Connecting to the saved session…"}
+              {running
+                ? "The agent is browsing. Take control to pause it and step in."
+                : browser && browser.url !== visited.url
+                  ? "Page visited. The browser has moved on."
+                  : browser?.status === "closed"
+                    ? "Session saved. Take control to reopen it."
+                    : browser?.status === "error"
+                      ? "Session needs attention. Take control to reconnect."
+                      : previewFailed
+                        ? "Preview unavailable. You can still take control."
+                        : "Connecting to the saved session…"}
             </Text>
           ) : null}
         </View>
       )}
       <ErrorNotice error={failure || error} />
-      {!loading && visited && (
+      {!loading && (visited || failedSession) && (
         <Button
           icon={Hand}
-          disabled={!browser || running}
-          onPress={() => browser && open({ type: "browser", browser })}
+          disabled={!browser}
+          onPress={() =>
+            browser && (takeControl ? takeControl(browser) : open({ type: "browser", browser }))
+          }
           style={{ backgroundColor: "#F9F9FA", minHeight: 38, paddingVertical: 8 }}
         >
-          Take control
+          {running ? "Take control · pauses the agent" : "Take control"}
         </Button>
       )}
       {!!error && (

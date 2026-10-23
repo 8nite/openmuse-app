@@ -36,6 +36,20 @@ pnpm --dir apps/mobile build:android
 
 The `build:ios` and `build:android` commands validate and export platform JavaScript/Hermes bundles. They do not create signed installable apps. `ios` and `android` run Expo’s native development-build workflows and need the platform toolchains.
 
+## PWA and push notifications (web)
+
+`build:web` exports an installable PWA (`manifest.webmanifest`, icons, `sw.js` for the
+offline app shell; `scripts/pwa-index.js` patches the tags into `index.html`).
+
+- In-app/tab-hidden alerts use the Web Notification API (`src/web-notify.ts`,
+  `src/use-web-notifications.ts`). No server needed.
+- Closed-app push uses Web Push: the Notifications sheet has an "Enable push" toggle
+  (`src/web-push.ts`) that registers the browser with `POST /api/agent/push/subscribe`.
+  The API sends via `web-push` whenever `AgentService.notify()` fires.
+  Requires `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` / `VAPID_CONTACT` on the server
+  (generate with `npx -y web-push generate-vapid-keys`); without them the push
+  endpoints 404 and everything else keeps working. Served over HTTPS in production.
+
 ## Behavior
 
 - Chat, Activity, Ideas, Goals and Apps are the primary navigation. Tasks, timelines and notifications refresh from the durable server state. Apps contains Mail, Calendar, Browser, Files and Connections.

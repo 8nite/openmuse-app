@@ -10,6 +10,23 @@ import { AppError } from "./errors.ts";
 
 const FILE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+// Chat uploads accept images and text alongside PDFs. Extension-keyed storage keeps
+// the bytes servable with their real Content-Type; every entry is validated here.
+const SUPPORTED_FILES: Record<string, string> = {
+  "application/pdf": ".pdf",
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/webp": ".webp",
+  "image/gif": ".gif",
+  "text/plain": ".txt",
+  "text/markdown": ".md",
+  "text/csv": ".csv",
+};
+
+export function extensionForMime(mimeType: string): string | undefined {
+  return SUPPORTED_FILES[mimeType.toLowerCase().split(";")[0].trim()];
+}
+
 export function sanitizeFileName(name: string): string {
   const base = name.split(/[\\/]/).at(-1) ?? "document.pdf";
   // Slice code points, not UTF-16 units, so a surrogate pair is never split in half.
@@ -52,18 +69,29 @@ export class Files {
     source: string,
     parentId?: string,
     operationKey?: string,
+    mimeType = "application/pdf",
   ): Promise<Artifact> {
     const id = operationKey === undefined ? randomUUID() : deterministicFileId(owner, operationKey);
     if (operationKey !== undefined) {
       const existing = await this.db.get<Artifact>(owner, "files", id);
       if (existing) return this.signed(owner, existing);
     }
-    if (bytes.length > 10 * 1024 * 1024) throw new AppError("PDFs must be 10 MB or smaller", 413);
-    let metadata = await inspectPdf(bytes);
+    const normalized = mimeType.toLowerCase().split(";")[0].trim();
+    const extension = extensionForMime(normalized);
+    if (!extension)
+      throw new AppError(
+        `Files of type ${mimeType || "unknown"} are not supported. Use a PDF, image (PNG, JPEG, WebP, GIF) or text file (TXT, Markdown, CSV).`,
+        415,
+      );
+    if (bytes.length > 10 * 1024 * 1024) throw new AppError("Files must be 10 MB or smaller", 413);
+    const isPdf = normalized === "application/pdf";
+    let metadata = isPdf
+      ? await inspectPdf(bytes)
+      : { pageCount: 0, fields: undefined as Artifact["fields"] };
     if (metadata.pageCount > 500) throw new AppError("PDFs must have 500 pages or fewer", 422);
     const directory = join(this.config.dataDir, "files");
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    const path = this.pathFor(id);
+    const path = this.pathFor(id, normalized);
     if (operationKey === undefined) {
       await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
     } else {
@@ -75,7 +103,7 @@ export class Files {
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
           bytes = await readFile(path);
-          metadata = await inspectPdf(bytes);
+          if (isPdf) metadata = await inspectPdf(bytes);
         }
       } finally {
         await rm(temporary, { force: true });
@@ -85,7 +113,7 @@ export class Files {
     const artifact: Artifact = {
       id,
       name: safeName,
-      mimeType: "application/pdf",
+      mimeType: normalized,
       size: bytes.length,
       pageCount: metadata.pageCount,
       fields: metadata.fields,
@@ -113,16 +141,17 @@ export class Files {
     if (!file) throw new AppError("File not found", 404);
     return file;
   }
-  private pathFor(id: string): string {
+  private pathFor(id: string, mimeType = "application/pdf"): string {
     assertFileId(id);
     const directory = resolve(this.config.dataDir, "files");
-    const resolved = resolve(directory, `${id}.pdf`);
+    const file = `${id}${extensionForMime(mimeType) ?? ".pdf"}`;
+    const resolved = resolve(directory, file);
     if (!resolved.startsWith(`${directory}${sep}`)) throw new AppError("File not found", 404);
     return resolved;
   }
   async bytes(owner: string, id: string) {
-    await this.get(owner, id);
-    return readFile(this.pathFor(id));
+    const file = await this.get(owner, id);
+    return readFile(this.pathFor(id, file.mimeType));
   }
   async fill(
     owner: string,
@@ -131,6 +160,8 @@ export class Files {
     operationKey?: string,
   ) {
     const file = await this.get(owner, id);
+    if (file.mimeType !== "application/pdf")
+      throw new AppError("Only PDFs can be filled. Images and text files open as-is.", 422);
     const bytes = await this.bytes(owner, id);
     const output = await fillPdf(bytes, values);
     return this.import(

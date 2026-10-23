@@ -17,6 +17,7 @@ import {
   Plus,
   Search,
   ShieldCheck,
+  Smartphone,
   Sparkles,
   Upload,
 } from "lucide-react-native";
@@ -40,6 +41,7 @@ import type {
 } from "../../../packages/domain/src";
 import { API_URL } from "./api";
 import { browserAddress } from "./browser-address";
+import { useComputerDraft } from "./computer-drafts";
 import { localDateTime, startOfZonedDay, zonedInstant } from "./date-time";
 import {
   Button,
@@ -47,8 +49,10 @@ import {
   Chip,
   colors,
   dateLabel,
+  describeFile,
   Empty,
   ErrorNotice,
+  fileKindLabel,
   IconButton,
   LinkRow,
   Mascot,
@@ -944,7 +948,16 @@ export function FilesScreen() {
     setBusy(true);
     try {
       const result = await DocumentPicker.getDocumentAsync({
-        type: "application/pdf",
+        type: [
+          "image/png",
+          "image/jpeg",
+          "image/webp",
+          "image/gif",
+          "application/pdf",
+          "text/plain",
+          "text/markdown",
+          "text/csv",
+        ],
         copyToCacheDirectory: true,
       });
       if (result.canceled) return;
@@ -961,12 +974,12 @@ export function FilesScreen() {
           httpMethod: "POST",
           uploadType: FileSystem.FileSystemUploadType.MULTIPART,
           fieldName: "file",
-          mimeType: "application/pdf",
+          mimeType: file.mimeType || "application/octet-stream",
           headers: { Authorization: `Bearer ${api.token}` },
         });
         const payload = JSON.parse(result.body);
         if (result.status < 200 || result.status >= 300)
-          throw new Error(payload.error || "Could not import this PDF.");
+          throw new Error(payload.error || "Could not import this file.");
         artifact = payload;
       }
       await refresh();
@@ -977,19 +990,29 @@ export function FilesScreen() {
       setBusy(false);
     }
   }
+  // Chat composer attachments upload directly to the send box and are
+  // tagged "Chat attachment" so this library stays uncrowded.
+  const library = w.files.filter((f) => f.source !== "Chat attachment");
+  const chatCount = w.files.length - library.length;
   return (
     <View style={{ gap: 20 }}>
       <View style={s.between}>
         <Text style={[s.muted, { flex: 1, marginRight: 15 }]}>
-          Documents, with a little room to work.
+          Documents, images and text, with a little room to work.
         </Text>
         <Button primary icon={Upload} busy={busy} onPress={() => void upload()}>
-          Import PDF
+          Import file
         </Button>
       </View>
       <ErrorNotice error={error} />
+      {!!chatCount && (
+        <Text style={s.small}>
+          {chatCount} chat attachment{chatCount === 1 ? "" : "s"} attached directly in chat · hidden
+          here
+        </Text>
+      )}
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 18 }}>
-        {w.files.map((f) => (
+        {library.map((f) => (
           <Pressable
             key={f.id}
             onPress={() => open({ type: "file", file: f })}
@@ -1034,7 +1057,7 @@ export function FilesScreen() {
                   ))}
                 </View>
                 <View style={{ position: "absolute", bottom: 12, right: 14 }}>
-                  <Chip>PDF</Chip>
+                  <Chip>{fileKindLabel(f.mimeType)}</Chip>
                 </View>
               </View>
               <View style={{ padding: 21, gap: 6 }}>
@@ -1042,8 +1065,7 @@ export function FilesScreen() {
                   {f.name}
                 </Text>
                 <Text style={s.small}>
-                  {f.pageCount} {f.pageCount === 1 ? "page" : "pages"} ·{" "}
-                  {Math.max(1, Math.round(f.size / 1024))} KB
+                  {describeFile(f)} · {Math.max(1, Math.round(f.size / 1024))} KB
                 </Text>
                 <View style={[s.between, { marginTop: 9 }]}>
                   <Chip>{f.source}</Chip>
@@ -1054,12 +1076,12 @@ export function FilesScreen() {
           </Pressable>
         ))}
       </View>
-      {!w.files.length && (
+      {!library.length && (
         <Card>
           <Empty
             icon={FileText}
             title="Your documents live here"
-            detail="Import a PDF or open a mail attachment to read, fill supported form fields, and share a copy."
+            detail="Import a PDF, image or text file, or open a mail attachment to read, fill supported form fields, and share a copy."
           />
         </Card>
       )}
@@ -1184,6 +1206,7 @@ export function ActivityScreen() {
 }
 export function ConnectionsScreen({ query = "" }: { query?: string }) {
   const { workspace: w, api, refresh, notify, open } = useWorkspace();
+  const [, setComputerTab] = useComputerDraft("tab");
   const [selected, setSelected] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -1242,6 +1265,14 @@ export function ConnectionsScreen({ query = "" }: { query?: string }) {
       group: "browser",
     },
     {
+      id: "phone",
+      name: "Phone worker",
+      icon: Smartphone,
+      color: "#5B5BD6",
+      connected: w.connections.some((c) => c.id === "device" && c.status === "connected"),
+      group: "device",
+    },
+    {
       id: "openbot",
       name: "OpenBot",
       icon: Sparkles,
@@ -1270,9 +1301,20 @@ export function ConnectionsScreen({ query = "" }: { query?: string }) {
                   key={row.id}
                   accessibilityRole="button"
                   accessibilityLabel={`Manage ${row.name}`}
-                  onPress={() =>
-                    row.group === "browser" ? open({ type: "computer" }) : setSelected(row.group)
-                  }
+                  onPress={() => {
+                    if (row.group === "browser") return open({ type: "computer" });
+                    if (row.group === "device") {
+                      const enabled = w.connections.some(
+                        (c) => c.id === "device" && c.status !== "unconfigured",
+                      );
+                      if (enabled) {
+                        setComputerTab("Phone");
+                        return open({ type: "computer" });
+                      }
+                      return setSelected(row.group);
+                    }
+                    return setSelected(row.group);
+                  }}
                   style={[
                     s.row,
                     {
@@ -1320,11 +1362,43 @@ export function ConnectionsScreen({ query = "" }: { query?: string }) {
       {!rows.length && <Text style={s.muted}>No matching connectors.</Text>}
       {selected && (
         <Sheet
-          title={selected === "google" ? "Google connections" : "OpenBot"}
-          subtitle={selected === "google" ? google?.account : "A computer for your agent"}
+          title={
+            selected === "google"
+              ? "Google connections"
+              : selected === "device"
+                ? "Phone worker"
+                : "OpenBot"
+          }
+          subtitle={
+            selected === "google"
+              ? google?.account
+              : selected === "device"
+                ? "Take control of your phone"
+                : "A computer for your agent"
+          }
           onClose={() => setSelected(undefined)}
         >
-          {selected === "google" ? (
+          {selected === "device" ? (
+            <View style={{ gap: 14 }}>
+              <Text style={s.text}>Connect a phone worker to take control from OpenMuse.</Text>
+              <Text style={s.muted}>
+                Set DEVICE_ENABLED=true and DEVICE_WORKER_URL on the server for local development,
+                or pair the Android worker app. The Phone tab appears once the device connection is
+                configured.
+              </Text>
+              <Button
+                primary
+                icon={Smartphone}
+                onPress={() => {
+                  setSelected(undefined);
+                  setComputerTab("Phone");
+                  open({ type: "computer" });
+                }}
+              >
+                Open Phone tab
+              </Button>
+            </View>
+          ) : selected === "google" ? (
             <View style={{ gap: 18 }}>
               <Text style={s.muted}>
                 Bring Gmail and Google Calendar into your conversations. Choose read access, then

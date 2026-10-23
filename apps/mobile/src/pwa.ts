@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
-// ponytail: web-only PWA bootstrap; native platforms no-op.
+// ponytail: web-only PWA bootstrap; native platforms no-op. Push delivery itself
+// lives in the service worker + server VAPID sender (apps/server/src/engine/push.ts).
 export function ensurePwa() {
   if (typeof window === "undefined" || typeof document === "undefined") return;
   // Manifest + theme/meta icons (expo export does not emit them).

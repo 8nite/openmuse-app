@@ -15,6 +15,7 @@ Enable it on the API and any separate task worker, then restart them:
 ```dotenv
 COMPUTER_ENABLED=true
 COMPUTER_IMAGE=openmuse-computer:local
+# COMPUTER_NETWORK=enabled  # default disabled; bridge egress so terminal commands can reach the internet
 ```
 
 Open **Computer → Terminal → Start computer**. Run `pwd` or `python3 --version`. Commands execute inside the Linux container with `/workspace` as their default working directory. Their output, exit code, and status appear in command history.
@@ -100,7 +101,7 @@ The terminal runs bounded commands and displays their saved results. It is not a
 
 The workspace is a Docker container running as a nonroot user, with a read-only root filesystem, limited temporary storage and resources, dropped capabilities, and no added privileges. It receives no host directory mounts, Docker socket, model keys, Google tokens, or API access key. A named volume provides persistent `/workspace` storage.
 
-Terminal networking is disabled. The existing browser worker handles public web access through its own destination checks; see its [network boundary](../apps/worker/README.md#network-boundary). Browser profiles and workspace files have separate storage and lifecycle controls.
+Terminal networking is disabled by default and can be enabled with `COMPUTER_NETWORK=enabled`, which attaches the container to the bridge network so commands can reach the internet directly. The existing browser worker handles public web access through its own destination checks; see its [network boundary](../apps/worker/README.md#network-boundary). Browser profiles and workspace files have separate storage and lifecycle controls.
 
 The E2B desktop provider differs from Docker in these ways:
 

@@ -72,11 +72,16 @@ type Inspection = z.infer<typeof inspectionSchema>;
 export class DockerComputer implements ComputerBackend {
   readonly provider = "docker";
   readonly receipts = "computer-commands";
-  readonly network = "disabled";
+  get network(): "enabled" | "disabled" {
+    return this.config.computerNetwork === "enabled" ? "enabled" : "disabled";
+  }
   constructor(
     private readonly config: Config,
     private readonly docker: DockerRunner,
   ) {}
+  private expectedNetworkMode() {
+    return this.network === "enabled" ? "bridge" : "none";
+  }
   private image() {
     const image = this.config.computerImage ?? "openmuse-computer:local";
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,250}$/.test(image))
@@ -115,6 +120,10 @@ export class DockerComputer implements ComputerBackend {
     const c = result.data[0],
       h = c.HostConfig;
     const empty = (list: unknown[] | null) => !list?.length;
+    // Fail closed in both directions: a container whose network mode does not
+    // match COMPUTER_NETWORK is never attached, whether that means unexpected
+    // egress or an unexpected lockdown after the setting changed.
+    const expectedNetwork = this.expectedNetworkMode();
     const safe =
       c.Name === `/${identity.container}` &&
       c.Config.Image === this.image() &&
@@ -132,7 +141,7 @@ export class DockerComputer implements ComputerBackend {
       empty(h.CapAdd) &&
       h.SecurityOpt?.length === 1 &&
       h.SecurityOpt.includes("no-new-privileges") &&
-      h.NetworkMode === "none" &&
+      h.NetworkMode === expectedNetwork &&
       h.Memory > 0 &&
       h.Memory <= 536870912 &&
       h.MemorySwap === h.Memory &&
@@ -155,7 +164,7 @@ export class DockerComputer implements ComputerBackend {
       c.Mounts[0].Name === identity.volume &&
       c.Mounts[0].Destination === "/workspace" &&
       c.Mounts[0].RW &&
-      Object.keys(c.NetworkSettings.Networks).every((network) => network === "none");
+      Object.keys(c.NetworkSettings.Networks).every((network) => network === expectedNetwork);
     if (!safe)
       throw new AppError(
         "Computer ownership or isolation does not match this deployment; refusing to attach",
@@ -235,7 +244,7 @@ export class DockerComputer implements ComputerBackend {
       "--security-opt",
       "no-new-privileges",
       "--network",
-      "none",
+      this.expectedNetworkMode(),
       "--ipc",
       "private",
       "--memory",

@@ -44,6 +44,40 @@ export async function checkBrowserWorker(
     assert.equal(image.readUInt32BE(16), 1280);
     assert.equal(image.readUInt32BE(20), 800);
     await api(`/sessions/${id}/input`, { type: "scroll", deltaY: 500 });
+    // Takeover mouse path: press, drag repositioning, release — like a human
+    // hold or drag on the live preview.
+    await api(`/sessions/${id}/input`, { type: "down", x: 640, y: 400 });
+    await api(`/sessions/${id}/input`, { type: "move", x: 660, y: 420 });
+    await api(`/sessions/${id}/input`, { type: "up" });
+    // Hover pointer fast path: live cursor without the serial queue.
+    await api(`/sessions/${id}/move`, { type: "move", x: 100, y: 100 });
+    const badMove = await fetch(`${address.base}/sessions/${id}/move`, {
+      headers,
+      method: "POST",
+      body: JSON.stringify({ type: "move", x: -1, y: 0 }),
+    });
+    assert.equal(badMove.status, 400);
+    assert.equal((await badMove.json()).error.code, "INVALID_INPUT");
+    // Live screencast: JPEG frames over multipart, smoother than screenshots.
+    const stream = await fetch(`${address.base}/sessions/${id}/stream`, { headers });
+    assert.equal(stream.status, 200);
+    assert.match(stream.headers.get("content-type") ?? "", /multipart\/x-mixed-replace/);
+    assert(stream.body);
+    const reader = stream.body.getReader();
+    let seen = Buffer.alloc(0);
+    const jpegMagic = Buffer.from([0xff, 0xd8]);
+    for (
+      let i = 0;
+      i < 200 && !(seen.includes("openmuse-frame") && seen.includes(jpegMagic));
+      i++
+    ) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      seen = Buffer.concat([seen, Buffer.from(value)]);
+    }
+    assert.ok(seen.includes("openmuse-frame"), "stream sends multipart frames");
+    assert.ok(seen.includes(jpegMagic), "stream sends JPEG frames");
+    await reader.cancel();
     const navigated = await (
       await api(`/sessions/${id}/navigate`, { url: `${fixtureOrigin}/other` })
     ).json();

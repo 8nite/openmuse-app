@@ -71,7 +71,7 @@ export async function createWorkerServer(
         return;
       }
       const match =
-        /^\/sessions\/([^/]+)\/(navigate|close|screenshot|read|input|downloads)(?:\/([^/]+))?$/.exec(
+        /^\/sessions\/([^/]+)\/(navigate|close|screenshot|read|input|move|downloads|stream)(?:\/([^/]+))?$/.exec(
           pathname,
         );
       if (!match) throw new WorkerError("NOT_FOUND", "Worker endpoint not found.", 404);
@@ -84,7 +84,57 @@ export async function createWorkerServer(
         json(200, await browser.closeSession(id));
       else if (action === "input" && !downloadId && request.method === "POST")
         json(200, await browser.input(id, await readBody(request)));
-      else if (action === "read" && !downloadId && request.method === "GET")
+      else if (action === "move" && !downloadId && request.method === "POST") {
+        await browser.move(id, await readBody(request));
+        json(200, { ok: true });
+      } else if (action === "stream" && !downloadId && request.method === "GET") {
+        // Live MJPEG screencast. The subscription starts before headers so a
+        // closed session still fails as JSON instead of a broken stream.
+        let latest: Buffer | null = null;
+        let ready = false;
+        const send = (frame: Buffer) => {
+          latest = frame;
+          if (ready) writeFrame(frame);
+        };
+        const writeFrame = (frame: Buffer) => {
+          try {
+            response.write(
+              `--openmuse-frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`,
+            );
+            response.write(frame);
+            response.write("\r\n");
+          } catch {
+            /* Client gone; the close handler below unsubscribes. */
+          }
+        };
+        let unsubscribe: (() => void) | null = null;
+        const onClose = () => {
+          if (unsubscribe) {
+            unsubscribe();
+            unsubscribe = null;
+          }
+        };
+        response.on("close", onClose);
+        try {
+          // A closed session aborts the stream so the viewer reconnects
+          // instead of freezing on the last frame.
+          unsubscribe = await browser.subscribe(id, send, () => response.destroy());
+        } catch (error) {
+          response.removeListener("close", onClose);
+          throw error;
+        }
+        response.writeHead(200, {
+          "content-type": "multipart/x-mixed-replace; boundary=openmuse-frame",
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+        });
+        ready = true;
+        if (latest) writeFrame(latest);
+        // Hold the request open until the viewer disconnects.
+        await new Promise<void>((resolve) => response.on("close", resolve));
+        onClose();
+        return;
+      } else if (action === "read" && !downloadId && request.method === "GET")
         json(200, await browser.read(id));
       else if (action === "screenshot" && !downloadId && request.method === "GET") {
         const bytes = await browser.screenshot(id);
@@ -116,7 +166,11 @@ export async function createWorkerServer(
       else response.end();
     }
   });
-  server.requestTimeout = 30_000;
+  // Navigations legitimately take 45s+ on heavy pages (plus Chromium launch
+  // on first open), so the socket must outlive the API client's own abort
+  // or real loads die as "worker unavailable". Failure detection stays on
+  // the client side, which aborts first when the worker is truly stuck.
+  server.requestTimeout = 120_000;
   server.headersTimeout = 10_000;
   server.keepAliveTimeout = 5_000;
   server.maxRequestsPerSocket = 100;

@@ -15,6 +15,7 @@ import {
   Save,
   Send,
   ShieldCheck,
+  Smartphone,
   Trash2,
   X,
 } from "lucide-react-native";
@@ -25,6 +26,7 @@ import {
   type Artifact,
   type BrowserSession,
   type CalendarEvent,
+  type DeviceSession,
   type EmailDraft,
   type EventDraft,
   emailDraftSchema,
@@ -46,6 +48,7 @@ import {
   Chip,
   colors,
   dateLabel,
+  describeFile,
   Empty,
   ErrorNotice,
   Field,
@@ -77,6 +80,7 @@ export function Details({ detail }: { detail: Detail }) {
   if (detail.type === "file") return <FileDetail file={detail.file} />;
   if (detail.type === "review") return <ReviewDetail initial={detail.action} />;
   if (detail.type === "browser") return <BrowserDetail initial={detail.browser} />;
+  if (detail.type === "device") return <DeviceDetail initial={detail.device} />;
   return (
     <Sheet title="Your workspace" subtitle="A little room for everything." onClose={close}>
       {[
@@ -173,7 +177,7 @@ function MailDetail({ mail: m }: { mail: Mail }) {
               <LinkRow
                 key={id}
                 title={file.name}
-                detail={`${file.pageCount} pages · PDF attachment`}
+                detail={`${describeFile(file)} attachment`}
                 icon={FileText}
                 onPress={() => open({ type: "file", file })}
               />
@@ -324,20 +328,24 @@ function EmailEditor({ draft }: { draft?: Partial<EmailDraft> & { id?: string } 
       {w.files.length > 0 && (
         <Card style={{ padding: 16, marginBottom: 18 }}>
           <Text style={[s.heading, { fontSize: 13, marginBottom: 5 }]}>Attachments</Text>
-          {w.files.map((f) => (
-            <CheckRow
-              key={f.id}
-              checked={attachments.includes(f.id)}
-              label={`${f.name} · ${Math.max(1, Math.round(f.size / 1024))} KB`}
-              onPress={() =>
-                setAttachments(
-                  attachments.includes(f.id)
-                    ? attachments.filter((id) => id !== f.id)
-                    : [...attachments, f.id],
-                )
-              }
-            />
-          ))}
+          {/* Chat attachments attach directly in the chat composer; only the
+              Files library is listed here so many chat uploads don't crowd it. */}
+          {w.files
+            .filter((f) => f.source !== "Chat attachment" || attachments.includes(f.id))
+            .map((f) => (
+              <CheckRow
+                key={f.id}
+                checked={attachments.includes(f.id)}
+                label={`${f.name} · ${Math.max(1, Math.round(f.size / 1024))} KB`}
+                onPress={() =>
+                  setAttachments(
+                    attachments.includes(f.id)
+                      ? attachments.filter((id) => id !== f.id)
+                      : [...attachments, f.id],
+                  )
+                }
+              />
+            ))}
         </Card>
       )}
       <ErrorNotice error={error} />
@@ -594,6 +602,43 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
     }
   }
   const email = action.kind === "email.send";
+  const deviceAction = action.kind === "device.action";
+  const phoneData = deviceAction
+    ? (action.data as {
+        sessionId?: unknown;
+        intentUri?: unknown;
+        action?: {
+          type?: unknown;
+          intentUri?: unknown;
+          x?: unknown;
+          y?: unknown;
+          x1?: unknown;
+          y1?: unknown;
+          x2?: unknown;
+          y2?: unknown;
+          text?: unknown;
+          key?: unknown;
+        };
+      })
+    : null;
+  const phoneSession =
+    phoneData && typeof phoneData.sessionId === "string"
+      ? (w.devices ?? []).find((item) => item.id === phoneData.sessionId)
+      : undefined;
+  const phoneActionType =
+    phoneData && typeof phoneData.action?.type === "string" ? phoneData.action.type : "action";
+  const phoneTarget =
+    phoneActionType === "launch"
+      ? String(phoneData?.action?.intentUri ?? phoneData?.intentUri ?? "")
+      : phoneActionType === "tap"
+        ? `(${String(phoneData?.action?.x ?? "?")}, ${String(phoneData?.action?.y ?? "?")})`
+        : phoneActionType === "swipe"
+          ? `(${String(phoneData?.action?.x1 ?? "?")}, ${String(phoneData?.action?.y1 ?? "?")}) to (${String(phoneData?.action?.x2 ?? "?")}, ${String(phoneData?.action?.y2 ?? "?")})`
+          : phoneActionType === "text"
+            ? String(phoneData?.action?.text ?? "")
+            : phoneActionType === "key"
+              ? String(phoneData?.action?.key ?? "")
+              : "";
   return (
     <Sheet
       title={pending ? "One last look" : action.title}
@@ -617,8 +662,28 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
         </Chip>
       </View>
       <Card style={{ gap: 13 }}>
-        <ReviewLine label="Account" value={action.account || w.profile.email} />
-        {email ? (
+        <ReviewLine
+          label="Account"
+          value={deviceAction ? "Phone worker (paired device)" : action.account || w.profile.email}
+        />
+        {deviceAction ? (
+          <>
+            <ReviewLine label="Action" value={phoneActionType} />
+            <ReviewLine
+              label="Session"
+              value={
+                phoneSession
+                  ? `${phoneSession.title} · ${phoneSession.packageOrUrl}`
+                  : "New phone session"
+              }
+            />
+            {!!phoneTarget && <ReviewLine label="Target" value={phoneTarget} />}
+            <Text style={s.small}>
+              Approving controls your paired phone immediately. Screenshots before and after are
+              saved to the task as receipts.
+            </Text>
+          </>
+        ) : email ? (
           <>
             <ReviewLine label="To" value={arrayText(d.to)} />
             <ReviewLine label="Cc" value={arrayText(d.cc) || "None"} />
@@ -708,9 +773,11 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
                 ? "Approve locally"
                 : email
                   ? "Approve & send"
-                  : "Approve change"}
+                  : deviceAction
+                    ? "Approve & run"
+                    : "Approve change"}
             </Button>
-            {action.kind !== "calendar.delete" && (
+            {action.kind !== "calendar.delete" && !deviceAction && (
               <Button icon={Edit3} disabled={busy} onPress={() => void edit()}>
                 Edit details
               </Button>
@@ -755,7 +822,28 @@ function FileDetail({ file: f }: { file: Artifact }) {
   );
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [textPreview, setTextPreview] = useState<string | null>(null);
   const url = api.url(f.url || `/api/files/${f.id}/content`);
+  const isImage = f.mimeType.startsWith("image/");
+  const isText = f.mimeType.startsWith("text/");
+  useEffect(() => {
+    if (!isText) return;
+    let active = true;
+    fetch(url, { headers: { Authorization: `Bearer ${api.token}` } })
+      .then((response) => {
+        if (!response.ok) throw new Error("Could not load this file.");
+        return response.text();
+      })
+      .then((body) => {
+        if (active) setTextPreview(body.slice(0, 4000));
+      })
+      .catch(() => {
+        if (active) setTextPreview(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [url, isText, api.token]);
   async function fill() {
     setBusy(true);
     setError("");
@@ -776,12 +864,18 @@ function FileDetail({ file: f }: { file: Artifact }) {
         await Linking.openURL(url);
         return;
       }
-      const target = `${FileSystem.cacheDirectory}${f.id}.pdf`;
+      const extension = f.name.includes(".") ? f.name.split(".").pop() : "bin";
+      const target = `${FileSystem.cacheDirectory}${f.id}.${extension}`;
       await FileSystem.downloadAsync(url, target, {
         headers: { Authorization: `Bearer ${api.token}` },
       });
       if (await Sharing.isAvailableAsync())
-        await Sharing.shareAsync(target, { mimeType: "application/pdf", UTI: "com.adobe.pdf" });
+        await Sharing.shareAsync(
+          target,
+          f.mimeType === "application/pdf"
+            ? { mimeType: f.mimeType, UTI: "com.adobe.pdf" }
+            : { mimeType: f.mimeType },
+        );
       else throw new Error("Sharing is not available on this device.");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -790,11 +884,25 @@ function FileDetail({ file: f }: { file: Artifact }) {
   return (
     <Sheet
       title={f.name}
-      subtitle={`${f.pageCount} pages · ${Math.max(1, Math.round(f.size / 1024))} KB · ${f.source}`}
+      subtitle={`${describeFile(f)} · ${Math.max(1, Math.round(f.size / 1024))} KB · ${f.source}`}
       onClose={close}
       wide
     >
-      <PdfReader url={url} token={api.token} pageCount={f.pageCount} />
+      {isImage ? (
+        <Image
+          source={{ uri: url }}
+          resizeMode="contain"
+          style={{ width: "100%", height: 420, borderRadius: 12, backgroundColor: colors.canvas }}
+        />
+      ) : isText ? (
+        <Card>
+          <Text selectable style={[s.text, { lineHeight: 24 }]}>
+            {textPreview ?? "Loading preview…"}
+          </Text>
+        </Card>
+      ) : (
+        <PdfReader url={url} token={api.token} pageCount={f.pageCount} />
+      )}
       <View style={[s.row, { gap: 10, marginVertical: 18, flexWrap: "wrap" }]}>
         <Button icon={Download} onPress={() => void share()}>
           {Platform.OS === "web" ? "Open / download" : "Save or share"}
@@ -998,6 +1106,139 @@ function BrowserDetail({ initial }: { initial: BrowserSession }) {
           </Button>
         )}
         {!loading && browser.status !== "closed" && (
+          <Button icon={X} danger busy={busy} onPress={() => void mutate(true)}>
+            Close session
+          </Button>
+        )}
+      </View>
+    </Sheet>
+  );
+}
+function DeviceDetail({ initial }: { initial: DeviceSession }) {
+  const { workspace: w, api, refresh, close } = useWorkspace();
+  const [local, setLocal] = useState(initial);
+  const [intent, setIntent] = useState(initial.packageOrUrl);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [retry, setRetry] = useState(0);
+  const latest = (w.devices ?? []).find((d) => d.id === initial.id);
+  const device = {
+    ...(latest && latest.updatedAt > local.updatedAt ? latest : local),
+    consoleUrl: local.consoleUrl,
+    previewUrl: local.previewUrl,
+  };
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError("");
+    void api
+      .request<DeviceSession>(`/api/devices/${initial.id}`)
+      .then((session) => {
+        if (active) {
+          setLocal(session);
+          setLoading(false);
+        }
+      })
+      .catch((e) => {
+        if (active) setError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      active = false;
+    };
+  }, [api, initial.id, retry]);
+  async function mutate(end = false) {
+    if (busy || loading) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.request<DeviceSession>(
+        `/api/devices/${device.id}/${end ? "close" : "launch"}`,
+        end ? {} : { intentUri: intent },
+      );
+      setLocal(result);
+      setIntent(result.packageOrUrl);
+      await refresh();
+      if (end) close();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <Sheet
+      title={device.title || "Phone"}
+      subtitle={`${device.status} · updated ${timeLabel(device.updatedAt)}`}
+      onClose={close}
+      wide
+    >
+      <View style={[s.row, { gap: 10, marginBottom: 16 }]}>
+        <View style={{ flex: 1 }}>
+          <Field
+            label="Link or app address"
+            value={intent}
+            onChangeText={setIntent}
+            autoCapitalize="none"
+            keyboardType="url"
+            onSubmitEditing={() => void mutate()}
+          />
+        </View>
+        <Button
+          primary
+          busy={busy}
+          disabled={loading || !intent.trim()}
+          onPress={() => void mutate()}
+        >
+          Open
+        </Button>
+      </View>
+      <ErrorNotice error={error} />
+      {loading ? (
+        <View style={[s.row, { gap: 10, paddingVertical: 24 }]}>
+          {error ? (
+            <Button onPress={() => setRetry(retry + 1)}>Retry connection</Button>
+          ) : (
+            <>
+              <ActivityIndicator color={colors.blueDark} />
+              <Text style={s.muted}>Connecting to your phone…</Text>
+            </>
+          )}
+        </View>
+      ) : device.status === "active" && device.consoleUrl ? (
+        <BrowserConsole url={api.url(device.consoleUrl)} />
+      ) : device.status === "active" && device.previewUrl ? (
+        <Image
+          source={{ uri: api.url(device.previewUrl) }}
+          style={{ width: "100%", height: 450, backgroundColor: colors.canvas }}
+          resizeMode="contain"
+        />
+      ) : (
+        <Empty
+          icon={Smartphone}
+          title={device.status === "closed" ? "This session is closed" : "Preview is not available"}
+          detail={
+            device.status === "closed"
+              ? "Your phone session is saved. Reopen to continue where you left off."
+              : "Reconnect to continue with your paired phone."
+          }
+        />
+      )}
+      <View style={[s.row, { gap: 10, marginTop: 18, flexWrap: "wrap" }]}>
+        {!loading && device.status === "active" && device.consoleUrl && (
+          <Button
+            icon={ExternalLink}
+            onPress={() => void Linking.openURL(api.url(device.consoleUrl || ""))}
+          >
+            Open phone in a window
+          </Button>
+        )}
+        {!loading && (
+          <Button icon={RotateCw} disabled={busy} onPress={() => setRetry(retry + 1)}>
+            Refresh connection
+          </Button>
+        )}
+        {!loading && device.status !== "closed" && (
           <Button icon={X} danger busy={busy} onPress={() => void mutate(true)}>
             Close session
           </Button>

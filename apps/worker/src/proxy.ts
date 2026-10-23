@@ -33,7 +33,10 @@ export async function startEgressProxy(
           path: `${target.url.pathname}${target.url.search}`,
           method: incoming.method,
           headers,
-          timeout: 30_000,
+          // Slow origins are legitimate (heavy pages can take 45s+ to first
+          // byte); only genuinely hung sockets should die here. Matches the
+          // worker and API budgets so slow-but-real loads survive the chain.
+          timeout: 120_000,
           agent: false,
         },
         (result) => {

@@ -155,6 +155,12 @@ Web search is enabled by default. Set `WEB_SEARCH_ENABLED=false` on the API and 
 
 Search sends model-generated queries and context, which may include information from your conversation or task, plus a random per-chat/task session identifier to Parallel. See [Parallel's privacy policy](https://parallel.ai/privacy-policy). Free access is rate limited; failures are reported without a paid fallback. Stopping chat or interrupting a task cancels its search.
 
+## Voice messages
+
+The chat composer has a mic button. Tap to record, tap again to stop: the app uploads the recording to `POST /api/voice/transcribe`, the server converts it to text, and the transcript is appended to the draft for review. Sending delivers it to the LLM like any typed message.
+
+Transcription runs on the server, so it works for web and native apps alike. With `OPENAI_API_KEY` set, the server uses the OpenAI-compatible `/audio/transcriptions` endpoint (override the model with `VOICE_TRANSCRIBE_MODEL`, default `whisper-1`); otherwise, with a Google key set, it uses Gemini transcription (default `gemini-2.0-flash`). Without either key the endpoint returns `503`, and browsers with dictation support fall back to on-device speech recognition. Recordings are capped at 10 MB. Native apps need microphone permission, which the Expo config already declares.
+
 ## Browser worker
 
 Set `BROWSER_WORKER_URL=http://127.0.0.1:8790` and a random `WORKER_TOKEN` of at least 32 characters in `.env`.
@@ -177,7 +183,7 @@ docker build -t openmuse-computer:local apps/computer
 COMPUTER_ENABLED=true pnpm dev
 ```
 
-The API needs access to the Docker CLI and engine. Commands run in a nonroot container with no host-directory mounts or credentials. A named `/workspace` volume retains files when stopped. Terminal networking is disabled; public web access uses the browser worker. Commands have a 30-second limit and saved output/exit receipts. **Files** supports folders, text editing, and PDF transfer to/from Documents. This is a Linux container, not a full operating-system VM. [Setup, Colima option, and boundaries](docs/COMPUTER.md).
+The API needs access to the Docker CLI and engine. Commands run in a nonroot container with no host-directory mounts or credentials. A named `/workspace` volume retains files when stopped. Terminal networking is disabled unless `COMPUTER_NETWORK=enabled` (bridge egress for commands); public web access uses the browser worker. Commands have a 30-second limit and saved output/exit receipts. **Files** supports folders, text editing, and PDF transfer to/from Documents. This is a Linux container, not a full operating-system VM. [Setup, Colima option, and boundaries](docs/COMPUTER.md).
 
 ### Application storage
 

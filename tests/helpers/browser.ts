@@ -41,6 +41,9 @@ export async function browserFixture(
     allowedOrigins: [],
     workerUrl: `http://127.0.0.1:${address.port}`,
     workerToken: "test-worker-token-at-least-32-characters",
+    // Standby pool off by default so tests asserting exact worker call
+    // sequences stay deterministic; pool tests opt in explicitly.
+    standbySessions: 0,
   };
   const auth = new Auth(db, config, "test-signing-key");
   const service = new BrowserService(db, config, auth, new Files(db, config, auth));

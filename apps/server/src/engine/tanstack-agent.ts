@@ -22,26 +22,51 @@ import { MODEL_MAX_RETRIES } from "../config.ts";
 
 // Same "provider/model" strings, env vars and base URL formats as the AI SDK resolver in
 // @copilotkit/runtime. Each provider SDK retries transient failures up to MODEL_MAX_RETRIES times.
-function adapter(spec: string) {
+function adapter(spec: string, sessionId?: string) {
   const [, provider = "", model = ""] = spec.trim().match(/^([^/:]*)[/:](.*)$/) ?? [];
   if (!provider || !model.trim())
     throw new Error(
       `Invalid model string "${spec}". Use "openai/gpt-5", "anthropic/claude-sonnet-4.5", or "google/gemini-2.5-pro".`,
     );
   const id = model.trim();
+  // One line per agent run so the server log shows which model served it.
+  // Values only: provider/model id, gateway host, session prefix. No keys.
+  try {
+    const host =
+      (process.env.OPENAI_BASE_URL ?? "").replace(/^https?:\/\//, "").split("/")[0] || "default";
+    console.log(
+      `[model] ${provider.toLowerCase()}/${id} via ${host} session=${(sessionId ?? "none").slice(0, 8)}`,
+    );
+  } catch {
+    /* logging must never break a run */
+  }
   switch (provider.toLowerCase()) {
-    case "openai":
+    case "openai": {
+      // Gateways fronting several providers (e.g. the OpenCode Go inference
+      // gateway) route and cache by conversation. Go requires a stable
+      // x-opencode-session per conversation and its own user agent.
+      const goGateway = (process.env.OPENAI_BASE_URL ?? "").includes("opencode.ai/inference");
+      const defaultHeaders =
+        goGateway && sessionId
+          ? {
+              "User-Agent": "openmuse/0.1.0",
+              "x-opencode-session": sessionId,
+            }
+          : undefined;
       // OpenAI-compatible endpoints that do not implement the Responses API
       // tool loop (e.g. DeepSeek) can opt into the Chat Completions wire format.
       if (process.env.OPENAI_CHAT_COMPLETIONS === "true")
         return openaiChatCompletions(id as OpenAIChatModel, {
           baseURL: process.env.OPENAI_BASE_URL,
           maxRetries: MODEL_MAX_RETRIES,
+          ...(defaultHeaders ? { defaultHeaders } : {}),
         });
       return openaiText(id as OpenAIChatModel, {
         baseURL: process.env.OPENAI_BASE_URL,
         maxRetries: MODEL_MAX_RETRIES,
+        ...(defaultHeaders ? { defaultHeaders } : {}),
       });
+    }
     case "anthropic":
       // The AI SDK base URL ends in /v1; the Anthropic SDK adds /v1 itself.
       return anthropicText(id as AnthropicChatModel, {
@@ -138,7 +163,9 @@ export function tanstackAgent(options: {
       )
         system += `\n## Application State\nThis is state from the application that you can edit by calling AGUISendStateSnapshot or AGUISendStateDelta.\n\`\`\`json\n${JSON.stringify(input.state, null, 2)}\n\`\`\`\n`;
       return chat({
-        adapter: adapter(options.model),
+        // Thread IDs are stable per conversation/task, which is what
+        // session-routed gateways (OpenCode Go) need in x-opencode-session.
+        adapter: adapter(options.model, input.threadId),
         messages: converted.messages,
         systemPrompts: system ? [system] : [],
         tools: [
