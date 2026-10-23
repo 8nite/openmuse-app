@@ -90,8 +90,8 @@ test("deployed stack: computer browser is online end to end", { timeout: 180_000
   const console = await app.request(session.consoleUrl);
   assert.equal(console.status, 200);
   const html = await console.text();
-  assert.match(html, /Website address/);
-  assert.match(html, /Text to type in browser/);
+  assert.match(html, /OpenMuse browser/);
+  assert.match(html, /Live browser session/);
   assert.match(html, /onpointerdown/);
 
   // Takeover address bar: navigate from the console's own signed auth.
